@@ -1,0 +1,16 @@
+
+{
+    "proxy": "http://your-proxy:port",
+    "proxy_enabled": true,
+    "accounts": [
+        {
+            "team_id": "your-team-id",
+            "secure_c_ses": "your-secure-c-ses",
+            "host_c_oses": "your-host-c-oses",
+            "csesidx": "your-csesidx",
+            "user_agent": "Mozilla/5.0 ...",
+            "available": true
+        }
+    ],
+    "models": []
+}
