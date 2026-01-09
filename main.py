@@ -1,18 +1,50 @@
-import json, time, hmac, hashlib, base64, os, asyncio, uuid, ssl, re
+import json, time, os, asyncio, uuid, ssl, re
 from datetime import datetime, timezone, timedelta
 from typing import List, Optional, Union, Dict, Any
-from dataclasses import dataclass
 import logging
 from dotenv import load_dotenv
 
 import httpx
-from fastapi import FastAPI, HTTPException, Header, Request
-from fastapi.responses import StreamingResponse, HTMLResponse
+import aiofiles
+from fastapi import FastAPI, HTTPException, Header, Request, Body, Form
+from fastapi.responses import StreamingResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from util.streaming_parser import parse_json_array_stream_async
 from collections import deque
 from threading import Lock
+
+# 导入认证模块
+from core.auth import verify_api_key
+from core.session_auth import is_logged_in, login_user, logout_user, require_login, generate_session_secret
+
+# 导入核心模块
+from core.message import (
+    get_conversation_key,
+    parse_last_message,
+    build_full_context_text
+)
+from core.google_api import (
+    get_common_headers,
+    create_google_session,
+    upload_context_file,
+    get_session_file_metadata,
+    download_image_with_jwt,
+    save_image_to_hf
+)
+from core.account import (
+    AccountManager,
+    MultiAccountManager,
+    format_account_expiration,
+    load_multi_account_config,
+    load_accounts_from_source,
+    update_accounts_config as _update_accounts_config,
+    delete_account as _delete_account,
+    update_account_disabled_status as _update_account_disabled_status
+)
+
+# 导入 Uptime 追踪器
+import uptime_tracker
 
 # ---------- 日志配置 ----------
 
@@ -21,34 +53,42 @@ log_buffer = deque(maxlen=3000)
 log_lock = Lock()
 
 # 统计数据持久化
-STATS_FILE = "stats.json"
-stats_lock = Lock()
+STATS_FILE = "data/stats.json"
+stats_lock = asyncio.Lock()  # 改为异步锁
 
-def load_stats():
-    """加载统计数据"""
+async def load_stats():
+    """加载统计数据（异步）"""
     try:
         if os.path.exists(STATS_FILE):
-            with open(STATS_FILE, 'r', encoding='utf-8') as f:
-                return json.load(f)
+            async with aiofiles.open(STATS_FILE, 'r', encoding='utf-8') as f:
+                content = await f.read()
+                return json.loads(content)
     except Exception:
         pass
     return {
         "total_visitors": 0,
         "total_requests": 0,
         "request_timestamps": [],  # 最近1小时的请求时间戳
-        "visitor_ips": {}  # {ip: timestamp} 记录访问IP和时间
+        "visitor_ips": {},  # {ip: timestamp} 记录访问IP和时间
+        "account_conversations": {}  # {account_id: conversation_count} 账户对话次数
     }
 
-def save_stats(stats):
-    """保存统计数据"""
+async def save_stats(stats):
+    """保存统计数据（异步，避免阻塞事件循环）"""
     try:
-        with open(STATS_FILE, 'w', encoding='utf-8') as f:
-            json.dump(stats, f, ensure_ascii=False, indent=2)
+        async with aiofiles.open(STATS_FILE, 'w', encoding='utf-8') as f:
+            await f.write(json.dumps(stats, ensure_ascii=False, indent=2))
     except Exception as e:
         logger.error(f"[STATS] 保存统计数据失败: {str(e)[:50]}")
 
-# 初始化统计数据
-global_stats = load_stats()
+# 初始化统计数据（需要在启动时异步加载）
+global_stats = {
+    "total_visitors": 0,
+    "total_requests": 0,
+    "request_timestamps": [],
+    "visitor_ips": {},
+    "account_conversations": {}
+}
 
 class MemoryLogHandler(logging.Handler):
     """自定义日志处理器，将日志写入内存缓冲区"""
@@ -79,12 +119,14 @@ logger.addHandler(memory_handler)
 
 load_dotenv()
 # ---------- 配置 ----------
-PROXY        = os.getenv("PROXY") or None
+PROXY        = os.getenv("PROXY", "")
 TIMEOUT_SECONDS = 600
-API_KEY      = os.getenv("API_KEY") or None  # API 访问密钥（可选）
-PATH_PREFIX  = os.getenv("PATH_PREFIX")      # 路径前缀（必需，用于隐藏端点）
-ADMIN_KEY    = os.getenv("ADMIN_KEY")        # 管理员密钥（必需，用于访问管理端点）
-BASE_URL     = os.getenv("BASE_URL")         # 服务器完整URL（可选，用于图片URL生成）
+API_KEY      = os.getenv("API_KEY", "")           # API 访问密钥（可选，用于保护API端点）
+PATH_PREFIX  = os.getenv("PATH_PREFIX", "")       # 路径前缀（可选，用于隐藏端点路径）
+ADMIN_KEY    = os.getenv("ADMIN_KEY", "")         # 管理员密钥（必需，用于登录）
+BASE_URL     = os.getenv("BASE_URL", "")          # 服务器完整URL（可选，用于图片URL生成）
+SESSION_SECRET_KEY = os.getenv("SESSION_SECRET_KEY", generate_session_secret())  # Session加密密钥（自动生成）
+SESSION_EXPIRE_HOURS = int(os.getenv("SESSION_EXPIRE_HOURS", "24"))  # Session过期时间（默认24小时）
 
 # ---------- 公开展示配置 ----------
 LOGO_URL     = os.getenv("LOGO_URL", "")  # Logo URL（公开，为空则不显示）
@@ -92,18 +134,17 @@ CHAT_URL     = os.getenv("CHAT_URL", "")  # 开始对话链接（公开，为空
 MODEL_NAME   = os.getenv("MODEL_NAME", "gemini-business")  # 模型名称（公开）
 
 # ---------- 图片存储配置 ----------
-# 自动检测存储路径：优先使用持久化存储，否则使用临时存储
 if os.path.exists("/data"):
-    IMAGE_DIR = "/data/images"  # HF Pro持久化存储（重启不丢失）
+    IMAGE_DIR = "/data/images"  # HF Pro持久化存储
 else:
-    IMAGE_DIR = "./images"  # 临时存储（重启会丢失）
+    IMAGE_DIR = "./data/images"  # 本地持久化存储
 
 # ---------- 重试配置 ----------
 MAX_NEW_SESSION_TRIES = int(os.getenv("MAX_NEW_SESSION_TRIES", "5"))  # 新会话创建最多尝试账户数（默认5）
 MAX_REQUEST_RETRIES = int(os.getenv("MAX_REQUEST_RETRIES", "3"))      # 请求失败最多重试次数（默认3）
 MAX_ACCOUNT_SWITCH_TRIES = int(os.getenv("MAX_ACCOUNT_SWITCH_TRIES", "5"))  # 每次重试找账户的最大尝试次数（默认5）
 ACCOUNT_FAILURE_THRESHOLD = int(os.getenv("ACCOUNT_FAILURE_THRESHOLD", "3"))  # 账户连续失败阈值（默认3次）
-ACCOUNT_COOLDOWN_SECONDS = int(os.getenv("ACCOUNT_COOLDOWN_SECONDS", "300"))  # 账户冷却时间（默认300秒=5分钟）
+RATE_LIMIT_COOLDOWN_SECONDS = int(os.getenv("RATE_LIMIT_COOLDOWN_SECONDS", "600"))  # 429错误冷却时间（默认600秒=10分钟）
 SESSION_CACHE_TTL_SECONDS = int(os.getenv("SESSION_CACHE_TTL_SECONDS", "3600"))  # 会话缓存过期时间（默认3600秒=1小时）
 
 # ---------- 模型映射配置 ----------
@@ -117,11 +158,14 @@ MODEL_MAPPING = {
 
 # ---------- HTTP 客户端 ----------
 http_client = httpx.AsyncClient(
-    proxies=PROXY,
+    proxy=PROXY or None,
     verify=False,
     http2=False,
     timeout=httpx.Timeout(TIMEOUT_SECONDS, connect=60.0),
-    limits=httpx.Limits(max_keepalive_connections=20, max_connections=50)
+    limits=httpx.Limits(
+        max_keepalive_connections=100,  # 增加5倍：20 -> 100
+        max_connections=200              # 增加4倍：50 -> 200
+    )
 )
 
 # ---------- 工具函数 ----------
@@ -140,532 +184,132 @@ def get_base_url(request: Request) -> str:
 # ---------- 常量定义 ----------
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
 
-def get_common_headers(jwt: str) -> dict:
-    return {
-        "accept": "*/*",
-        "accept-encoding": "gzip, deflate, br, zstd",
-        "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
-        "authorization": f"Bearer {jwt}",
-        "content-type": "application/json",
-        "origin": "https://business.gemini.google",
-        "referer": "https://business.gemini.google/",
-        "user-agent": USER_AGENT,
-        "x-server-timeout": "1800",
-        "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
-        "sec-ch-ua-mobile": "?0",
-        "sec-ch-ua-platform": '"Windows"',
-        "sec-fetch-dest": "empty",
-        "sec-fetch-mode": "cors",
-        "sec-fetch-site": "cross-site",
-    }
-
-def urlsafe_b64encode(data: bytes) -> str:
-    return base64.urlsafe_b64encode(data).decode().rstrip("=")
-
-def kq_encode(s: str) -> str:
-    b = bytearray()
-    for ch in s:
-        v = ord(ch)
-        if v > 255:
-            b.append(v & 255)
-            b.append(v >> 8)
-        else:
-            b.append(v)
-    return urlsafe_b64encode(bytes(b))
-
-def create_jwt(key_bytes: bytes, key_id: str, csesidx: str) -> str:
-    now = int(time.time())
-    header = {"alg": "HS256", "typ": "JWT", "kid": key_id}
-    payload = {
-        "iss": "https://business.gemini.google",
-        "aud": "https://biz-discoveryengine.googleapis.com",
-        "sub": f"csesidx/{csesidx}",
-        "iat": now,
-        "exp": now + 300,
-        "nbf": now,
-    }
-    header_b64  = kq_encode(json.dumps(header, separators=(",", ":")))
-    payload_b64 = kq_encode(json.dumps(payload, separators=(",", ":")))
-    message     = f"{header_b64}.{payload_b64}"
-    sig         = hmac.new(key_bytes, message.encode(), hashlib.sha256).digest()
-    return f"{message}.{urlsafe_b64encode(sig)}"
-
 # ---------- 多账户支持 ----------
-@dataclass
-class AccountConfig:
-    """单个账户配置"""
-    account_id: str
-    secure_c_ses: str
-    host_c_oses: Optional[str]
-    csesidx: str
-    config_id: str
-    expires_at: Optional[str] = None  # 账户过期时间 (格式: "2025-12-23 10:59:21")
+# (AccountConfig, AccountManager, MultiAccountManager 已移至 core/account.py)
 
-    def get_remaining_hours(self) -> Optional[float]:
-        """计算账户剩余小时数"""
-        if not self.expires_at:
-            return None
-        try:
-            # 解析过期时间（假设为北京时间）
-            beijing_tz = timezone(timedelta(hours=8))
-            expire_time = datetime.strptime(self.expires_at, "%Y-%m-%d %H:%M:%S")
-            expire_time = expire_time.replace(tzinfo=beijing_tz)
-
-            # 当前时间（北京时间）
-            now = datetime.now(beijing_tz)
-
-            # 计算剩余时间
-            remaining = (expire_time - now).total_seconds() / 3600
-            return remaining
-        except Exception:
-            return None
-
-    def is_expired(self) -> bool:
-        """检查账户是否已过期"""
-        remaining = self.get_remaining_hours()
-        if remaining is None:
-            return False  # 未设置过期时间，默认不过期
-        return remaining <= 0
-
-def format_account_expiration(remaining_hours: Optional[float]) -> tuple:
-    """
-    格式化账户过期时间显示（基于12小时过期周期）
-
-    Args:
-        remaining_hours: 剩余小时数（None表示未设置过期时间）
-
-    Returns:
-        (status, status_color, expire_display) 元组
-    """
-    if remaining_hours is None:
-        # 未设置过期时间时显示为"未设置"
-        return ("未设置", "#9e9e9e", "未设置")
-    elif remaining_hours <= 0:
-        return ("已过期", "#f44336", "已过期")
-    elif remaining_hours < 3:  # 少于3小时
-        return ("即将过期", "#ff9800", f"{remaining_hours:.1f} 小时")
-    else:  # 3小时及以上，统一显示小时
-        return ("正常", "#4caf50", f"{remaining_hours:.1f} 小时")
-
-class AccountManager:
-    """单个账户管理器"""
-    def __init__(self, config: AccountConfig):
-        self.config = config
-        self.jwt_manager: Optional['JWTManager'] = None  # 延迟初始化
-        self.is_available = True
-        self.last_error_time = 0.0
-        self.error_count = 0
-
-    async def get_jwt(self, request_id: str = "") -> str:
-        """获取 JWT token (带错误处理)"""
-        try:
-            if self.jwt_manager is None:
-                # 延迟初始化 JWTManager (避免循环依赖)
-                self.jwt_manager = JWTManager(self.config)
-            jwt = await self.jwt_manager.get(request_id)
-            self.is_available = True
-            self.error_count = 0
-            return jwt
-        except Exception as e:
-            self.last_error_time = time.time()
-            self.error_count += 1
-            # 使用配置的失败阈值
-            if self.error_count >= ACCOUNT_FAILURE_THRESHOLD:
-                self.is_available = False
-                logger.error(f"[ACCOUNT] [{self.config.account_id}] JWT获取连续失败{self.error_count}次，账户已标记为不可用")
-            else:
-                # 安全：只记录异常类型，不记录详细信息
-                logger.warning(f"[ACCOUNT] [{self.config.account_id}] JWT获取失败({self.error_count}/{ACCOUNT_FAILURE_THRESHOLD}): {type(e).__name__}")
-            raise
-
-    def should_retry(self) -> bool:
-        """检查账户是否可重试（使用配置的冷却期）"""
-        if self.is_available:
-            return True
-        return time.time() - self.last_error_time > ACCOUNT_COOLDOWN_SECONDS
-
-class MultiAccountManager:
-    """多账户协调器"""
-    def __init__(self):
-        self.accounts: Dict[str, AccountManager] = {}
-        self.account_list: List[str] = []  # 账户ID列表 (用于轮询)
-        self.current_index = 0
-        self._lock = asyncio.Lock()
-        # 全局会话缓存：{conv_key: {"account_id": str, "session_id": str, "updated_at": float}}
-        self.global_session_cache: Dict[str, dict] = {}
-        self.cache_max_size = 1000  # 最大缓存条目数
-        self.cache_ttl = SESSION_CACHE_TTL_SECONDS  # 缓存过期时间（秒）
-
-    def _clean_expired_cache(self):
-        """清理过期的缓存条目"""
-        current_time = time.time()
-        expired_keys = [
-            key for key, value in self.global_session_cache.items()
-            if current_time - value["updated_at"] > self.cache_ttl
-        ]
-        for key in expired_keys:
-            del self.global_session_cache[key]
-        if expired_keys:
-            logger.info(f"[CACHE] 清理 {len(expired_keys)} 个过期会话缓存")
-
-    def _ensure_cache_size(self):
-        """确保缓存不超过最大大小（LRU策略）"""
-        if len(self.global_session_cache) > self.cache_max_size:
-            # 按更新时间排序，删除最旧的20%
-            sorted_items = sorted(
-                self.global_session_cache.items(),
-                key=lambda x: x[1]["updated_at"]
-            )
-            remove_count = len(sorted_items) - int(self.cache_max_size * 0.8)
-            for key, _ in sorted_items[:remove_count]:
-                del self.global_session_cache[key]
-            logger.info(f"[CACHE] LRU清理 {remove_count} 个最旧会话缓存")
-
-    async def set_session_cache(self, conv_key: str, account_id: str, session_id: str):
-        """线程安全地设置会话缓存"""
-        async with self._lock:
-            self.global_session_cache[conv_key] = {
-                "account_id": account_id,
-                "session_id": session_id,
-                "updated_at": time.time()
-            }
-            # 检查缓存大小
-            self._ensure_cache_size()
-
-    async def update_session_time(self, conv_key: str):
-        """线程安全地更新会话时间戳"""
-        async with self._lock:
-            if conv_key in self.global_session_cache:
-                self.global_session_cache[conv_key]["updated_at"] = time.time()
-
-    def add_account(self, config: AccountConfig):
-        """添加账户"""
-        manager = AccountManager(config)
-        self.accounts[config.account_id] = manager
-        self.account_list.append(config.account_id)
-        logger.info(f"[MULTI] [ACCOUNT] 添加账户: {config.account_id}")
-
-    async def get_account(self, account_id: Optional[str] = None, request_id: str = "") -> AccountManager:
-        """获取账户 (轮询或指定)"""
-        async with self._lock:
-            # 定期清理过期缓存（每次获取账户时检查）
-            self._clean_expired_cache()
-
-            req_tag = f"[req_{request_id}] " if request_id else ""
-
-            # 如果指定了账户ID
-            if account_id:
-                if account_id not in self.accounts:
-                    raise HTTPException(404, f"Account {account_id} not found")
-                account = self.accounts[account_id]
-                if not account.should_retry():
-                    raise HTTPException(503, f"Account {account_id} temporarily unavailable")
-                return account
-
-            # 轮询选择可用账户
-            available_accounts = [
-                acc_id for acc_id in self.account_list
-                if self.accounts[acc_id].should_retry()
-            ]
-
-            if not available_accounts:
-                raise HTTPException(503, "No available accounts")
-
-            # Round-robin（修复：基于可用账户列表的索引）
-            if not hasattr(self, '_available_index'):
-                self._available_index = 0
-
-            account_id = available_accounts[self._available_index % len(available_accounts)]
-            self._available_index = (self._available_index + 1) % len(available_accounts)
-
-            account = self.accounts[account_id]
-            logger.info(f"[MULTI] [ACCOUNT] {req_tag}选择账户: {account_id}")
-            return account
-
-# ---------- 多账户配置加载 ----------
-def load_multi_account_config() -> MultiAccountManager:
-    """从环境变量加载多账户配置（仅支持 ACCOUNTS_CONFIG JSON 格式）"""
-    manager = MultiAccountManager()
-
-    accounts_json = os.getenv("ACCOUNTS_CONFIG")
-    if not accounts_json:
-        raise ValueError(
-            "未找到 ACCOUNTS_CONFIG 环境变量。\n"
-            "请在环境变量中配置 JSON 格式的账户列表，格式示例：\n"
-            '[{"id":"account_1","csesidx":"xxx","config_id":"yyy","secure_c_ses":"zzz","host_c_oses":null,"expires_at":"2025-12-23 10:59:21"}]'
-        )
-
-    try:
-        accounts_data = json.loads(accounts_json)
-        if not isinstance(accounts_data, list):
-            raise ValueError("ACCOUNTS_CONFIG 必须是 JSON 数组格式")
-
-        for i, acc in enumerate(accounts_data, 1):
-            # 验证必需字段
-            required_fields = ["secure_c_ses", "csesidx", "config_id"]
-            missing_fields = [f for f in required_fields if f not in acc]
-            if missing_fields:
-                raise ValueError(f"账户 {i} 缺少必需字段: {', '.join(missing_fields)}")
-
-            config = AccountConfig(
-                account_id=acc.get("id", f"account_{i}"),
-                secure_c_ses=acc["secure_c_ses"],
-                host_c_oses=acc.get("host_c_oses"),
-                csesidx=acc["csesidx"],
-                config_id=acc["config_id"],
-                expires_at=acc.get("expires_at")
-            )
-
-            # 检查账户是否已过期
-            if config.is_expired():
-                logger.warning(f"[CONFIG] 账户 {config.account_id} 已过期，跳过加载")
-                continue
-
-            manager.add_account(config)
-
-        if not manager.accounts:
-            raise ValueError("没有有效的账户配置（可能全部已过期）")
-
-        logger.info(f"[CONFIG] 成功加载 {len(manager.accounts)} 个账户")
-        return manager
-
-    except json.JSONDecodeError as e:
-        logger.error(f"[CONFIG] ACCOUNTS_CONFIG JSON 解析失败: {str(e)}")
-        raise ValueError(f"ACCOUNTS_CONFIG 格式错误: {str(e)}")
-    except KeyError as e:
-        logger.error(f"[CONFIG] ACCOUNTS_CONFIG 缺少必需字段: {str(e)}")
-        raise ValueError(f"ACCOUNTS_CONFIG 缺少必需字段: {str(e)}")
-    except Exception as e:
-        logger.error(f"[CONFIG] 加载账户配置失败: {str(e)}")
-        raise
-
+# ---------- 配置文件管理 ----------
+# (配置管理函数已移至 core/account.py)
 
 # 初始化多账户管理器
-multi_account_mgr = load_multi_account_config()
+multi_account_mgr = load_multi_account_config(
+    http_client,
+    USER_AGENT,
+    ACCOUNT_FAILURE_THRESHOLD,
+    RATE_LIMIT_COOLDOWN_SECONDS,
+    SESSION_CACHE_TTL_SECONDS,
+    global_stats
+)
 
 # 验证必需的环境变量
-if not PATH_PREFIX:
-    logger.error("[SYSTEM] 未配置 PATH_PREFIX 环境变量，请设置后重启")
-    import sys
-    sys.exit(1)
-
 if not ADMIN_KEY:
     logger.error("[SYSTEM] 未配置 ADMIN_KEY 环境变量，请设置后重启")
     import sys
     sys.exit(1)
 
 # 启动日志
-logger.info(f"[SYSTEM] 路径前缀已配置: {PATH_PREFIX[:4]}****")
-logger.info(f"[SYSTEM] 用户端点: /{PATH_PREFIX}/v1/chat/completions")
-logger.info(f"[SYSTEM] 管理端点: /{PATH_PREFIX}/admin/")
-logger.info("[SYSTEM] 公开端点: /public/log/html")
+if PATH_PREFIX:
+    logger.info(f"[SYSTEM] 路径前缀已配置: {PATH_PREFIX[:4]}****")
+    logger.info(f"[SYSTEM] API端点: /{PATH_PREFIX}/v1/chat/completions")
+    logger.info(f"[SYSTEM] 管理端点: /{PATH_PREFIX}/")
+else:
+    logger.info("[SYSTEM] 未配置路径前缀，使用默认路径")
+    logger.info("[SYSTEM] API端点: /v1/chat/completions")
+    logger.info("[SYSTEM] 管理端点: /admin/")
+logger.info("[SYSTEM] 公开端点: /public/log/html, /public/stats, /public/uptime/html")
+logger.info(f"[SYSTEM] Session过期时间: {SESSION_EXPIRE_HOURS}小时")
 logger.info("[SYSTEM] 系统初始化完成")
 
 # ---------- JWT 管理 ----------
-class JWTManager:
-    def __init__(self, config: AccountConfig) -> None:
-        self.config = config
-        self.jwt: str = ""
-        self.expires: float = 0
-        self._lock = asyncio.Lock()
-
-    async def get(self, request_id: str = "") -> str:
-        async with self._lock:
-            if time.time() > self.expires:
-                await self._refresh(request_id)
-            return self.jwt
-
-    async def _refresh(self, request_id: str = "") -> None:
-        cookie = f"__Secure-C_SES={self.config.secure_c_ses}"
-        if self.config.host_c_oses:
-            cookie += f"; __Host-C_OSES={self.config.host_c_oses}"
-
-        req_tag = f"[req_{request_id}] " if request_id else ""
-        r = await http_client.get(
-            "https://business.gemini.google/auth/getoxsrf",
-            params={"csesidx": self.config.csesidx},
-            headers={
-                "cookie": cookie,
-                "user-agent": USER_AGENT,
-                "referer": "https://business.gemini.google/"
-            },
-        )
-        if r.status_code != 200:
-            logger.error(f"[AUTH] [{self.config.account_id}] {req_tag}JWT 刷新失败: {r.status_code}")
-            raise HTTPException(r.status_code, "getoxsrf failed")
-
-        txt = r.text[4:] if r.text.startswith(")]}'") else r.text
-        data = json.loads(txt)
-
-        key_bytes = base64.urlsafe_b64decode(data["xsrfToken"] + "==")
-        self.jwt     = create_jwt(key_bytes, data["keyId"], self.config.csesidx)
-        self.expires = time.time() + 270
-        logger.info(f"[AUTH] [{self.config.account_id}] {req_tag}JWT 刷新成功")
+# (JWTManager已移至 core/jwt.py)
 
 # ---------- Session & File 管理 ----------
-async def create_google_session(account_manager: AccountManager, request_id: str = "") -> str:
-    jwt = await account_manager.get_jwt(request_id)
-    headers = get_common_headers(jwt)
-    body = {
-        "configId": account_manager.config.config_id,
-        "additionalParams": {"token": "-"},
-        "createSessionRequest": {
-            "session": {"name": "", "displayName": ""}
-        }
-    }
-
-    req_tag = f"[req_{request_id}] " if request_id else ""
-    r = await http_client.post(
-        "https://biz-discoveryengine.googleapis.com/v1alpha/locations/global/widgetCreateSession",
-        headers=headers,
-        json=body,
-    )
-    if r.status_code != 200:
-        logger.error(f"[SESSION] [{account_manager.config.account_id}] {req_tag}Session 创建失败: {r.status_code}")
-        raise HTTPException(r.status_code, "createSession failed")
-    sess_name = r.json()["session"]["name"]
-    logger.info(f"[SESSION] [{account_manager.config.account_id}] {req_tag}创建成功: {sess_name[-12:]}")
-    return sess_name
-
-async def upload_context_file(session_name: str, mime_type: str, base64_content: str, account_manager: AccountManager, request_id: str = "") -> str:
-    """上传文件到指定 Session，返回 fileId"""
-    jwt = await account_manager.get_jwt(request_id)
-    headers = get_common_headers(jwt)
-
-    # 生成随机文件名
-    ext = mime_type.split('/')[-1] if '/' in mime_type else "bin"
-    file_name = f"upload_{int(time.time())}_{uuid.uuid4().hex[:6]}.{ext}"
-
-    body = {
-        "configId": account_manager.config.config_id,
-        "additionalParams": {"token": "-"},
-        "addContextFileRequest": {
-            "name": session_name,
-            "fileName": file_name,
-            "mimeType": mime_type,
-            "fileContents": base64_content
-        }
-    }
-
-    r = await http_client.post(
-        "https://biz-discoveryengine.googleapis.com/v1alpha/locations/global/widgetAddContextFile",
-        headers=headers,
-        json=body,
-    )
-
-    req_tag = f"[req_{request_id}] " if request_id else ""
-    if r.status_code != 200:
-        logger.error(f"[FILE] [{account_manager.config.account_id}] {req_tag}文件上传失败: {r.status_code}")
-        raise HTTPException(r.status_code, f"Upload failed: {r.text}")
-
-    data = r.json()
-    file_id = data.get("addContextFileResponse", {}).get("fileId")
-    logger.info(f"[FILE] [{account_manager.config.account_id}] {req_tag}文件上传成功: {mime_type}")
-    return file_id
+# (Google API函数已移至 core/google_api.py)
 
 # ---------- 消息处理逻辑 ----------
-def get_conversation_key(messages: List[dict]) -> str:
-    """使用第一条user消息生成对话指纹"""
-    if not messages:
-        return "empty"
-
-    # 只使用第一条user消息生成指纹（对话起点不变）
-    user_messages = [msg for msg in messages if msg.get("role") == "user"]
-    if not user_messages:
-        return "no_user_msg"
-
-    # 只取第一条user消息
-    first_user_msg = user_messages[0]
-    content = first_user_msg.get("content", "")
-
-    # 统一处理内容格式（字符串或数组）
-    if isinstance(content, list):
-        text = "".join([x.get("text", "") for x in content if x.get("type") == "text"])
-    else:
-        text = str(content)
-
-    # 标准化：去除首尾空白，转小写（避免因空格/大小写导致指纹不同）
-    text = text.strip().lower()
-
-    # 生成指纹
-    return hashlib.md5(text.encode()).hexdigest()
-
-def parse_last_message(messages: List['Message']):
-    """解析最后一条消息，分离文本和图片"""
-    if not messages:
-        return "", []
-    
-    last_msg = messages[-1]
-    content = last_msg.content
-    
-    text_content = ""
-    images = [] # List of {"mime": str, "data": str_base64}
-
-    if isinstance(content, str):
-        text_content = content
-    elif isinstance(content, list):
-        for part in content:
-            if part.get("type") == "text":
-                text_content += part.get("text", "")
-            elif part.get("type") == "image_url":
-                url = part.get("image_url", {}).get("url", "")
-                # 解析 Data URI: data:image/png;base64,xxxxxx
-                match = re.match(r"data:(image/[^;]+);base64,(.+)", url)
-                if match:
-                    images.append({"mime": match.group(1), "data": match.group(2)})
-                else:
-                    logger.warning(f"[FILE] 不支持的图片格式: {url[:30]}...")
-
-    return text_content, images
-
-def build_full_context_text(messages: List['Message']) -> str:
-    """仅拼接历史文本，图片只处理当次请求的"""
-    prompt = ""
-    for msg in messages:
-        role = "User" if msg.role in ["user", "system"] else "Assistant"
-        content_str = ""
-        if isinstance(msg.content, str):
-            content_str = msg.content
-        elif isinstance(msg.content, list):
-            for part in msg.content:
-                if part.get("type") == "text":
-                    content_str += part.get("text", "")
-                elif part.get("type") == "image_url":
-                    content_str += "[图片]"
-        
-        prompt += f"{role}: {content_str}\n\n"
-    return prompt
+# (消息处理函数已移至 core/message.py)
 
 # ---------- OpenAI 兼容接口 ----------
 app = FastAPI(title="Gemini-Business OpenAI Gateway")
+
+# ---------- Session 中间件配置 ----------
+from starlette.middleware.sessions import SessionMiddleware
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=SESSION_SECRET_KEY,
+    max_age=SESSION_EXPIRE_HOURS * 3600,  # 转换为秒
+    same_site="lax",
+    https_only=False  # 本地开发可设为False，生产环境建议True
+)
+
+# ---------- Uptime 追踪中间件 ----------
+@app.middleware("http")
+async def track_uptime_middleware(request: Request, call_next):
+    """追踪每个请求的成功/失败状态，用于 Uptime 监控"""
+    # 只追踪 API 请求（排除静态文件、管理端点等）
+    path = request.url.path
+    if path.startswith("/images/") or path.startswith("/public/") or path.startswith("/favicon"):
+        return await call_next(request)
+
+    start_time = time.time()
+    success = False
+    model = None
+
+    try:
+        response = await call_next(request)
+        success = response.status_code < 400
+
+        # 尝试从请求中提取模型信息
+        if hasattr(request.state, "model"):
+            model = request.state.model
+
+        # 记录 API 主服务状态
+        uptime_tracker.record_request("api_service", success)
+
+        # 如果有模型信息，记录模型状态
+        if model and model in uptime_tracker.SUPPORTED_MODELS:
+            uptime_tracker.record_request(model, success)
+
+        return response
+
+    except Exception as e:
+        # 请求失败 - 尝试提取模型信息（可能在异常前已设置）
+        if hasattr(request.state, "model"):
+            model = request.state.model
+
+        uptime_tracker.record_request("api_service", False)
+        if model and model in uptime_tracker.SUPPORTED_MODELS:
+            uptime_tracker.record_request(model, False)
+        raise
 
 # ---------- 图片静态服务初始化 ----------
 os.makedirs(IMAGE_DIR, exist_ok=True)
 app.mount("/images", StaticFiles(directory=IMAGE_DIR), name="images")
 if IMAGE_DIR == "/data/images":
-    logger.info(f"[SYSTEM] 图片静态服务已启用: /images/ -> {IMAGE_DIR} (持久化存储)")
+    logger.info(f"[SYSTEM] 图片静态服务已启用: /images/ -> {IMAGE_DIR} (HF Pro持久化)")
 else:
-    logger.info(f"[SYSTEM] 图片静态服务已启用: /images/ -> {IMAGE_DIR} (临时存储，重启会丢失)")
+    logger.info(f"[SYSTEM] 图片静态服务已启用: /images/ -> {IMAGE_DIR} (本地持久化)")
 
-# ---------- 认证装饰器 ----------
-from functools import wraps
-from fastapi import Request
+# ---------- 后台任务启动 ----------
+@app.on_event("startup")
+async def startup_event():
+    """应用启动时初始化后台任务"""
+    global global_stats
 
-def require_admin_key(func):
-    """验证管理员密钥（支持 URL 参数或 Header）"""
-    @wraps(func)
-    async def wrapper(*args, key: str = None, authorization: str = None, **kwargs):
-        # 支持 URL 参数 ?key=xxx 或 Authorization Header
-        admin_key = key
-        if not admin_key and authorization:
-            admin_key = authorization.replace("Bearer ", "") if authorization.startswith("Bearer ") else authorization
+    # 加载统计数据
+    global_stats = await load_stats()
+    logger.info(f"[SYSTEM] 统计数据已加载: {global_stats['total_requests']} 次请求, {global_stats['total_visitors']} 位访客")
 
-        if admin_key != ADMIN_KEY:
-            # 返回 404 而不是 401，假装端点不存在
-            raise HTTPException(404, "Not Found")
+    # 启动缓存清理任务
+    asyncio.create_task(multi_account_mgr.start_background_cleanup())
+    logger.info("[SYSTEM] 后台缓存清理任务已启动（间隔: 5分钟）")
 
-        return await func(*args, **kwargs)
-    return wrapper
+    # 启动 Uptime 数据聚合任务
+    asyncio.create_task(uptime_tracker.uptime_aggregation_task())
+    logger.info("[SYSTEM] Uptime 数据聚合任务已启动（间隔: 240秒）")
+
+# ---------- 导入模板模块 ----------
+# 注意：必须在所有全局变量初始化之后导入，避免循环依赖
+from core import templates
 
 # ---------- 日志脱敏函数 ----------
 def get_sanitized_logs(limit: int = 100) -> list:
@@ -899,532 +543,107 @@ def create_chunk(id: str, created: int, model: str, delta: dict, finish_reason: 
     }
     return json.dumps(chunk)
 
-# ---------- API Key 验证 ----------
-def verify_api_key(authorization: str = None):
-    """验证 API Key（如果配置了 API_KEY）"""
-    # 如果未配置 API_KEY，则跳过验证
-    if API_KEY is None:
-        return True
-
-    # 检查 Authorization header
-    if not authorization:
-        raise HTTPException(
-            status_code=401,
-            detail="Missing Authorization header"
-        )
-
-    # 支持两种格式：
-    # 1. Bearer YOUR_API_KEY
-    # 2. YOUR_API_KEY
-    token = authorization
-    if authorization.startswith("Bearer "):
-        token = authorization[7:]
-
-    if token != API_KEY:
-        logger.warning(f"[AUTH] API Key 验证失败")
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid API Key"
-        )
-
-    return True
-
-@app.get("/{path_prefix}/admin")
-@app.get("/{path_prefix}/admin/")
-async def admin_home(path_prefix: str, key: str = None, authorization: str = Header(None)):
-    """管理首页 - 显示API信息和错误提醒"""
-    # 验证路径前缀
-    if path_prefix != PATH_PREFIX:
+@app.get("/")
+async def home(request: Request):
+    """首页 - 根据PATH_PREFIX配置决定行为"""
+    if PATH_PREFIX:
+        # 如果设置了PATH_PREFIX（隐藏模式），首页返回404，不暴露任何信息
         raise HTTPException(404, "Not Found")
-
-    # 验证管理员密钥
-    admin_key = key or (authorization.replace("Bearer ", "") if authorization and authorization.startswith("Bearer ") else authorization)
-    if admin_key != ADMIN_KEY:
-        raise HTTPException(404, "Not Found")
-    # 获取错误统计
-    error_count = 0
-    with log_lock:
-        for log in log_buffer:
-            if log.get("level") in ["ERROR", "CRITICAL"]:
-                error_count += 1
-
-    # API Key 状态
-    api_key_status = ""
-    if API_KEY:
-        api_key_status = """
-            <div style="background: #e8f5e9; padding: 15px; border-radius: 8px; margin: 20px 0;">
-                <strong style="color: #2e7d32;">🔒 API Key 验证已启用</strong>
-                <p style="color: #4caf50; margin-top: 8px; font-size: 14px;">
-                    请求时需要在 Authorization header 中携带密钥
-                </p>
-            </div>
-        """
     else:
-        api_key_status = """
-            <div style="background: #fff3e0; padding: 15px; border-radius: 8px; margin: 20px 0;">
-                <strong style="color: #f57c00;">⚠️ API Key 验证未启用</strong>
-                <p style="color: #ff9800; margin-top: 8px; font-size: 14px;">
-                    任何人都可以访问此 API，建议设置 API_KEY 环境变量
-                </p>
-            </div>
-        """
+        # 未设置PATH_PREFIX（公开模式），根据登录状态重定向
+        if is_logged_in(request):
+            return await generate_admin_html(request, multi_account_mgr)
+        else:
+            return RedirectResponse(url="/login", status_code=302)
 
-    # 错误提醒
-    error_alert = ""
-    if error_count > 0:
-        error_alert = f"""
-            <div style="background: #ffebee; padding: 15px; border-radius: 8px; margin: 20px 0;">
-                <strong>检测到 <span style="color: #f44336; font-weight: bold; font-size: 18px;">{error_count}</span> 条错误日志</strong>
-                <a href="/public/log/html" style="color: #f44336; font-weight: bold; margin-left: 15px;">查看详情 →</a>
-            </div>
-        """
+# ---------- 登录/登出端点（支持可选PATH_PREFIX） ----------
 
-    # 获取账户信息
-    accounts_html = ""
-    for account_id, account_manager in multi_account_mgr.accounts.items():
-        config = account_manager.config
-        remaining_hours = config.get_remaining_hours()
+# 不带PATH_PREFIX的登录端点
+@app.get("/login")
+async def admin_login_get(request: Request, error: str = None):
+    """登录页面"""
+    return await templates.get_login_html(request, error)
 
-        # 使用统一的格式化函数
-        status_text, status_color, expire_display = format_account_expiration(remaining_hours)
+@app.post("/login")
+async def admin_login_post(request: Request, admin_key: str = Form(...)):
+    """处理登录表单提交"""
+    if admin_key == ADMIN_KEY:
+        login_user(request)
+        logger.info(f"[AUTH] 管理员登录成功")
+        return RedirectResponse(url="/", status_code=302)
+    else:
+        logger.warning(f"[AUTH] 登录失败 - 密钥错误")
+        return await templates.get_login_html(request, error="密钥错误，请重试")
 
-        availability = "可用" if account_manager.is_available else "不可用"
-        availability_color = "#4caf50" if account_manager.is_available else "#f44336"
+@app.post("/logout")
+@require_login(redirect_to_login=False)
+async def admin_logout(request: Request):
+    """登出"""
+    logout_user(request)
+    logger.info(f"[AUTH] 管理员已登出")
+    return RedirectResponse(url="/login", status_code=302)
 
-        accounts_html += f"""
-            <div class="card">
-                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
-                    <div>
-                        <strong style="color: #1a1a1a; font-size: 14px;">{config.account_id}</strong>
-                        <span style="background: {availability_color}; color: white; padding: 2px 6px; border-radius: 4px; font-size: 10px; margin-left: 6px;">{availability}</span>
-                    </div>
-                    <span style="color: {status_color}; font-weight: 600; font-size: 12px;">{status_text}</span>
-                </div>
-                <div style="font-size: 12px; color: #6b6b6b; line-height: 1.6;">
-                    <div>过期: {config.expires_at or '未设置'}</div>
-                    <div>剩余: <strong style="color: {status_color};">{expire_display}</strong></div>
-                </div>
-            </div>
-        """
+# 带PATH_PREFIX的登录端点（如果配置了PATH_PREFIX）
+if PATH_PREFIX:
+    @app.get(f"/{PATH_PREFIX}/login")
+    async def admin_login_get_prefixed(request: Request, error: str = None):
+        """登录页面（带前缀）"""
+        return await templates.get_login_html(request, error)
 
-    html_content = f"""
-    <!DOCTYPE html>
-    <html>
-        <head>
-            <meta charset="utf-8">
-            <meta name="viewport" content="width=device-width, initial-scale=1">
-            <title>系统管理面板 - Gemini Business API</title>
-            <style>
-                * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-                body {{
-                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-                    background: #fafaf9;
-                    min-height: 100vh;
-                    padding: 20px;
-                }}
-                .container {{
-                    max-width: 1200px;
-                    margin: 0 auto;
-                    background: white;
-                    border-radius: 16px;
-                    padding: 40px;
-                    box-shadow: 0 2px 8px rgba(0,0,0,0.08);
-                }}
-                h1 {{
-                    color: #1a1a1a;
-                    font-size: 28px;
-                    font-weight: 600;
-                    margin-bottom: 8px;
-                    text-align: center;
-                }}
-                .subtitle {{
-                    text-align: center;
-                    color: #6b6b6b;
-                    font-size: 14px;
-                    margin-bottom: 30px;
-                    display: flex;
-                    justify-content: space-between;
-                    align-items: center;
-                    gap: 12px;
-                }}
-                .section {{
-                    margin-bottom: 24px;
-                }}
-                .section-title {{
-                    font-size: 18px;
-                    font-weight: 600;
-                    color: #1a1a1a;
-                    margin-bottom: 16px;
-                }}
-                .grid {{
-                    display: grid;
-                    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
-                    gap: 16px;
-                    margin-bottom: 16px;
-                }}
-                .card {{
-                    background: #fafaf9;
-                    padding: 20px;
-                    border: 1px solid #e5e5e5;
-                    border-radius: 12px;
-                    transition: all 0.15s ease;
-                }}
-                .card:hover {{
-                    border-color: #d4d4d4;
-                    box-shadow: 0 0 8px rgba(0,0,0,0.08);
-                }}
-                .card h3 {{
-                    font-size: 15px;
-                    color: #1a1a1a;
-                    margin-bottom: 12px;
-                    font-weight: 600;
-                }}
-                .btn {{
-                    display: inline-block;
-                    background: #1a73e8;
-                    color: white !important;
-                    padding: 8px 16px;
-                    border-radius: 8px;
-                    text-decoration: none;
-                    font-size: 14px;
-                    font-weight: 500;
-                    transition: background 0.15s ease;
-                }}
-                .btn:hover {{ background: #1557b0; }}
-                .list {{ list-style: none; line-height: 1.8; }}
-                .list li {{
-                    color: #6b6b6b;
-                    font-size: 13px;
-                    padding: 4px 0;
-                }}
-                .env-var {{
-                    display: flex;
-                    justify-content: space-between;
-                    align-items: center;
-                    padding: 8px 0;
-                    border-bottom: 1px solid #f0f0f0;
-                }}
-                .env-var:last-child {{
-                    border-bottom: none;
-                }}
-                .env-name {{
-                    font-family: 'Courier New', monospace;
-                    font-size: 13px;
-                    color: #1a73e8;
-                    font-weight: 600;
-                }}
-                .env-desc {{
-                    font-size: 12px;
-                    color: #6b6b6b;
-                }}
-                .env-value {{
-                    font-size: 12px;
-                    color: #9e9e9e;
-                    font-style: italic;
-                }}
-                .badge {{
-                    display: inline-block;
-                    padding: 2px 8px;
-                    border-radius: 4px;
-                    font-size: 11px;
-                    font-weight: 600;
-                }}
-                .badge-required {{
-                    background: #ffebee;
-                    color: #c62828;
-                }}
-                .badge-optional {{
-                    background: #e8f5e9;
-                    color: #2e7d32;
-                }}
-                code {{
-                    background: #f5f5f4;
-                    padding: 2px 6px;
-                    border-radius: 4px;
-                    font-size: 12px;
-                    color: #1a73e8;
-                }}
-                a {{ color: #1a73e8; text-decoration: none; }}
-                a:hover {{ color: #1557b0; }}
-                .account-grid {{
-                    display: grid;
-                    grid-template-columns: repeat(3, 1fr);
-                    gap: 16px;
-                }}
-                @media (max-width: 768px) {{
-                    .container {{ padding: 25px; }}
-                    h1 {{ font-size: 24px; }}
-                    .subtitle {{
-                        flex-direction: column;
-                        align-items: center;
-                        gap: 12px;
-                    }}
-                    .subtitle span {{
-                        text-align: center;
-                        font-size: 13px;
-                    }}
-                    .subtitle .btn {{
-                        width: 100%;
-                        text-align: center;
-                    }}
-                    .grid {{ grid-template-columns: 1fr; }}
-                    .account-grid {{ grid-template-columns: 1fr; }}
-                }}
-            </style>
-        </head>
-        <body>
-            <div class="container">
-                <h1>系统管理面板</h1>
-                <div class="subtitle">
-                    <span>Gemini Business API - 多账户代理服务</span>
-                    <a href="/public/log/html" class="btn" style="font-size: 13px; padding: 6px 12px;">查看公开日志</a>
-                </div>
+    @app.post(f"/{PATH_PREFIX}/login")
+    async def admin_login_post_prefixed(request: Request, admin_key: str = Form(...)):
+        """处理登录表单提交（带前缀）"""
+        if admin_key == ADMIN_KEY:
+            login_user(request)
+            logger.info(f"[AUTH] 管理员登录成功")
+            return RedirectResponse(url=f"/{PATH_PREFIX}", status_code=302)
+        else:
+            logger.warning(f"[AUTH] 登录失败 - 密钥错误")
+            return await templates.get_login_html(request, error="密钥错误，请重试")
 
-                {api_key_status}
-                {error_alert}
+    @app.post(f"/{PATH_PREFIX}/logout")
+    @require_login(redirect_to_login=False)
+    async def admin_logout_prefixed(request: Request):
+        """登出（带前缀）"""
+        logout_user(request)
+        logger.info(f"[AUTH] 管理员已登出")
+        return RedirectResponse(url=f"/{PATH_PREFIX}/login", status_code=302)
 
-                <!-- 账户状态 -->
-                <div class="section">
-                    <div class="section-title">账户状态 ({len(multi_account_mgr.accounts)} 个)</div>
-                    <div class="account-grid">
-                        {accounts_html if accounts_html else '<div class="card"><p style="color: #6b6b6b; font-size: 14px;">暂无账户</p></div>'}
-                    </div>
-                </div>
+# ---------- 管理端点（需要登录） ----------
 
-                <!-- 环境变量配置 -->
-                <div class="section">
-                    <div class="section-title">环境变量配置</div>
-                    <div class="grid">
-                        <div class="card">
-                            <h3>必需变量 <span class="badge badge-required">REQUIRED</span></h3>
-                            <div style="margin-top: 12px;">
-                                <div class="env-var">
-                                    <div>
-                                        <div class="env-name">ACCOUNTS_CONFIG</div>
-                                        <div class="env-desc">JSON格式账户列表</div>
-                                    </div>
-                                </div>
-                                <div class="env-var">
-                                    <div>
-                                        <div class="env-name">PATH_PREFIX</div>
-                                        <div class="env-desc">API路径前缀</div>
-                                    </div>
-                                    <div class="env-value">当前: {PATH_PREFIX}</div>
-                                </div>
-                                <div class="env-var">
-                                    <div>
-                                        <div class="env-name">ADMIN_KEY</div>
-                                        <div class="env-desc">管理员密钥</div>
-                                    </div>
-                                    <div class="env-value">已设置</div>
-                                </div>
-                            </div>
-                        </div>
-
-                        <div class="card">
-                            <h3>可选变量 <span class="badge badge-optional">OPTIONAL</span></h3>
-                            <div style="margin-top: 12px;">
-                                <div class="env-var">
-                                    <div>
-                                        <div class="env-name">API_KEY</div>
-                                        <div class="env-desc">API访问密钥</div>
-                                    </div>
-                                    <div class="env-value">{'已设置' if API_KEY else '未设置'}</div>
-                                </div>
-                                <div class="env-var">
-                                    <div>
-                                        <div class="env-name">BASE_URL</div>
-                                        <div class="env-desc">图片URL生成（推荐设置）</div>
-                                    </div>
-                                    <div class="env-value">{'已设置' if BASE_URL else '未设置（自动检测）'}</div>
-                                </div>
-                                <div class="env-var">
-                                    <div>
-                                        <div class="env-name">PROXY</div>
-                                        <div class="env-desc">代理地址</div>
-                                    </div>
-                                    <div class="env-value">{'已设置' if PROXY else '未设置'}</div>
-                                </div>
-                                <div class="env-var">
-                                    <div>
-                                        <div class="env-name">SESSION_CACHE_TTL_SECONDS</div>
-                                        <div class="env-desc">会话缓存过期时间</div>
-                                    </div>
-                                    <div class="env-value">{SESSION_CACHE_TTL_SECONDS} 秒</div>
-                                </div>
-                                <div class="env-var">
-                                    <div>
-                                        <div class="env-name">LOGO_URL</div>
-                                        <div class="env-desc">Logo URL（公开，为空则不显示）</div>
-                                    </div>
-                                    <div class="env-value">{'已设置' if LOGO_URL else '未设置'}</div>
-                                </div>
-                                <div class="env-var">
-                                    <div>
-                                        <div class="env-name">CHAT_URL</div>
-                                        <div class="env-desc">开始对话链接（公开，为空则不显示）</div>
-                                    </div>
-                                    <div class="env-value">{'已设置' if CHAT_URL else '未设置'}</div>
-                                </div>
-                                <div class="env-var">
-                                    <div>
-                                        <div class="env-name">MODEL_NAME</div>
-                                        <div class="env-desc">模型名称（公开）</div>
-                                    </div>
-                                    <div class="env-value">{MODEL_NAME}</div>
-                                </div>
-                            </div>
-                        </div>
-
-                        <div class="card">
-                            <h3>重试配置 <span class="badge badge-optional">OPTIONAL</span></h3>
-                            <div style="margin-top: 12px;">
-                                <div class="env-var">
-                                    <div>
-                                        <div class="env-name">MAX_NEW_SESSION_TRIES</div>
-                                        <div class="env-desc">新会话尝试账户数</div>
-                                    </div>
-                                    <div class="env-value">{MAX_NEW_SESSION_TRIES}</div>
-                                </div>
-                                <div class="env-var">
-                                    <div>
-                                        <div class="env-name">MAX_REQUEST_RETRIES</div>
-                                        <div class="env-desc">请求失败重试次数</div>
-                                    </div>
-                                    <div class="env-value">{MAX_REQUEST_RETRIES}</div>
-                                </div>
-                                <div class="env-var">
-                                    <div>
-                                        <div class="env-name">ACCOUNT_FAILURE_THRESHOLD</div>
-                                        <div class="env-desc">账户失败阈值</div>
-                                    </div>
-                                    <div class="env-value">{ACCOUNT_FAILURE_THRESHOLD} 次</div>
-                                </div>
-                                <div class="env-var">
-                                    <div>
-                                        <div class="env-name">ACCOUNT_COOLDOWN_SECONDS</div>
-                                        <div class="env-desc">账户冷却时间</div>
-                                    </div>
-                                    <div class="env-value">{ACCOUNT_COOLDOWN_SECONDS} 秒</div>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-
-                <!-- 模型与端点 -->
-                <div class="section">
-                    <div class="section-title">服务信息</div>
-                    <div class="grid">
-                        <div class="card">
-                            <h3>支持的模型</h3>
-                            <ul class="list">
-                                <li><code>gemini-auto</code> - 自动选择（默认）</li>
-                                <li><code>gemini-2.5-flash</code> - Flash 2.5</li>
-                                <li><code>gemini-2.5-pro</code> - Pro 2.5</li>
-                                <li><code>gemini-3-flash-preview</code> - Flash 3 预览</li>
-                                <li><code>gemini-3-pro-preview</code> - Pro 3 预览 <strong style="color: #10b981;">（支持图片生成）</strong></li>
-                            </ul>
-                            <div style="margin-top: 16px; padding: 14px 16px; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 6px;">
-                                <div style="font-weight: 600; color: #334155; margin-bottom: 10px; font-size: 13px;">图片生成说明</div>
-                                <div style="font-size: 13px; color: #475569; line-height: 1.8;">
-                                    仅 <code style="background: #e0e7ff; color: #4338ca; padding: 2px 6px; border-radius: 3px; font-weight: 500;">gemini-3-pro-preview</code> 支持图片生成<br>
-                                    保存路径: <code style="background: #e0e7ff; color: #4338ca; padding: 2px 6px; border-radius: 3px; font-weight: 500;">{IMAGE_DIR}</code><br>
-                                    存储类型: {'<span style="color: #059669; font-weight: 600;">持久化（重启保留）</span>' if IMAGE_DIR == '/data/images' else '<span style="color: #dc2626; font-weight: 600;">临时（重启丢失）</span>'}
-                                </div>
-                            </div>
-                        </div>
-
-                        <div class="card" style="grid-column: span 2;">
-                            <h3>API 端点</h3>
-                            <ul class="list">
-                                <li><code>POST /{PATH_PREFIX}/v1/chat/completions</code> - 聊天接口（流式+多模态）</li>
-                                <li><code>GET /{PATH_PREFIX}/v1/models</code> - 获取模型列表</li>
-                                <li><code>GET /{PATH_PREFIX}/admin</code> - 管理首页</li>
-                                <li><code>GET /{PATH_PREFIX}/admin/health?key={{ADMIN_KEY}}</code> - 健康检查</li>
-                                <li><code>GET /{PATH_PREFIX}/admin/accounts?key={{ADMIN_KEY}}</code> - 获取账户状态（JSON）</li>
-                                <li><code>GET /{PATH_PREFIX}/admin/log?key={{ADMIN_KEY}}</code> - 获取日志（JSON）</li>
-                                <li><code>GET /{PATH_PREFIX}/admin/log/html?key={{ADMIN_KEY}}</code> - 日志查看器（HTML）</li>
-                                <li><code>DELETE /{PATH_PREFIX}/admin/log?confirm=yes&key={{ADMIN_KEY}}</code> - 清空日志</li>
-                                <li><code>GET /public/stats</code> - 公开统计信息</li>
-                                <li><code>GET /public/log</code> - 公开日志（JSON，脱敏）</li>
-                                <li><code>GET /public/log/html</code> - 公开日志查看器（HTML，脱敏）</li>
-                                <li><code>GET /docs</code> - FastAPI自动生成的API文档（Swagger UI）</li>
-                                <li><code>GET /redoc</code> - FastAPI自动生成的API文档（ReDoc）</li>
-                            </ul>
-                        </div>
-                    </div>
-                </div>
-            </div>
-        </body>
-    </html>
-    """
+# 不带PATH_PREFIX的管理端点
+@app.get("/admin")
+@require_login()
+async def admin_home_no_prefix(request: Request):
+    """管理首页"""
+    html_content = templates.generate_admin_html(request, multi_account_mgr, show_hide_tip=False)
     return HTMLResponse(content=html_content)
 
-@app.get("/{path_prefix}/v1/models")
-async def list_models(path_prefix: str, authorization: str = Header(None)):
-    # 验证路径前缀
-    if path_prefix != PATH_PREFIX:
-        raise HTTPException(404, "Not Found")
+# 带PATH_PREFIX的管理端点（如果配置了PATH_PREFIX）
+if PATH_PREFIX:
+    @app.get(f"/{PATH_PREFIX}")
+    @require_login()
+    async def admin_home_prefixed(request: Request):
+        """管理首页（带前缀）"""
+        return await admin_home_no_prefix(request=request)
 
-    # 验证 API Key
-    verify_api_key(authorization)
+# ---------- 管理API端点（需要登录） ----------
 
-    data = []
-    now = int(time.time())
-    for m in MODEL_MAPPING.keys():
-        data.append({
-            "id": m,
-            "object": "model",
-            "created": now,
-            "owned_by": "google",
-            "permission": []
-        })
-    return {"object": "list", "data": data}
-
-@app.get("/{path_prefix}/v1/models/{model_id}")
-async def get_model(path_prefix: str, model_id: str, authorization: str = Header(None)):
-    # 验证路径前缀
-    if path_prefix != PATH_PREFIX:
-        raise HTTPException(404, "Not Found")
-
-    # 验证 API Key
-    verify_api_key(authorization)
-
-    return {"id": model_id, "object": "model"}
-
-@app.get("/{path_prefix}/admin/health")
-async def admin_health(path_prefix: str, key: str = None, authorization: str = Header(None)):
-    # 验证路径前缀
-    if path_prefix != PATH_PREFIX:
-        raise HTTPException(404, "Not Found")
-
-    # 验证管理员密钥
-    admin_key = key or (authorization.replace("Bearer ", "") if authorization and authorization.startswith("Bearer ") else authorization)
-    if admin_key != ADMIN_KEY:
-        raise HTTPException(404, "Not Found")
-
+@app.get("/admin/health")
+@require_login()
+async def admin_health(request: Request):
     return {"status": "ok", "time": datetime.utcnow().isoformat()}
 
-@app.get("/{path_prefix}/admin/accounts")
-async def admin_get_accounts(path_prefix: str, key: str = None, authorization: str = Header(None)):
+@app.get("/admin/accounts")
+@require_login()
+async def admin_get_accounts(request: Request):
     """获取所有账户的状态信息"""
-    # 验证路径前缀
-    if path_prefix != PATH_PREFIX:
-        raise HTTPException(404, "Not Found")
-
-    # 验证管理员密钥
-    admin_key = key or (authorization.replace("Bearer ", "") if authorization and authorization.startswith("Bearer ") else authorization)
-    if admin_key != ADMIN_KEY:
-        raise HTTPException(404, "Not Found")
-
     accounts_info = []
     for account_id, account_manager in multi_account_mgr.accounts.items():
         config = account_manager.config
         remaining_hours = config.get_remaining_hours()
-
-        # 使用统一的格式化函数
         status, status_color, remaining_display = format_account_expiration(remaining_hours)
+        cooldown_seconds, cooldown_reason = account_manager.get_cooldown_info()
 
         accounts_info.append({
             "id": config.account_id,
@@ -1433,796 +652,284 @@ async def admin_get_accounts(path_prefix: str, key: str = None, authorization: s
             "remaining_hours": remaining_hours,
             "remaining_display": remaining_display,
             "is_available": account_manager.is_available,
-            "error_count": account_manager.error_count
+            "error_count": account_manager.error_count,
+            "disabled": config.disabled,
+            "cooldown_seconds": cooldown_seconds,
+            "cooldown_reason": cooldown_reason,
+            "conversation_count": account_manager.conversation_count
         })
 
-    return {
-        "total": len(accounts_info),
-        "accounts": accounts_info
-    }
+    return {"total": len(accounts_info), "accounts": accounts_info}
 
-@app.get("/{path_prefix}/admin/log")
+@app.get("/admin/accounts-config")
+@require_login()
+async def admin_get_config(request: Request):
+    """获取完整账户配置"""
+    try:
+        accounts_data = load_accounts_from_source()
+        return {"accounts": accounts_data}
+    except Exception as e:
+        logger.error(f"[CONFIG] 获取配置失败: {str(e)}")
+        raise HTTPException(500, f"获取失败: {str(e)}")
+
+@app.put("/admin/accounts-config")
+@require_login()
+async def admin_update_config(request: Request, accounts_data: list = Body(...)):
+    """更新整个账户配置"""
+    global multi_account_mgr
+    try:
+        multi_account_mgr = _update_accounts_config(
+            accounts_data, multi_account_mgr, http_client, USER_AGENT,
+            ACCOUNT_FAILURE_THRESHOLD, RATE_LIMIT_COOLDOWN_SECONDS,
+            SESSION_CACHE_TTL_SECONDS, global_stats
+        )
+        return {"status": "success", "message": "配置已更新", "account_count": len(multi_account_mgr.accounts)}
+    except Exception as e:
+        logger.error(f"[CONFIG] 更新配置失败: {str(e)}")
+        raise HTTPException(500, f"更新失败: {str(e)}")
+
+@app.delete("/admin/accounts/{account_id}")
+@require_login()
+async def admin_delete_account(request: Request, account_id: str):
+    """删除单个账户"""
+    global multi_account_mgr
+    try:
+        multi_account_mgr = _delete_account(
+            account_id, multi_account_mgr, http_client, USER_AGENT,
+            ACCOUNT_FAILURE_THRESHOLD, RATE_LIMIT_COOLDOWN_SECONDS,
+            SESSION_CACHE_TTL_SECONDS, global_stats
+        )
+        return {"status": "success", "message": f"账户 {account_id} 已删除", "account_count": len(multi_account_mgr.accounts)}
+    except Exception as e:
+        logger.error(f"[CONFIG] 删除账户失败: {str(e)}")
+        raise HTTPException(500, f"删除失败: {str(e)}")
+
+@app.put("/admin/accounts/{account_id}/disable")
+@require_login()
+async def admin_disable_account(request: Request, account_id: str):
+    """手动禁用账户"""
+    global multi_account_mgr
+    try:
+        multi_account_mgr = _update_account_disabled_status(
+            account_id, True, multi_account_mgr, http_client, USER_AGENT,
+            ACCOUNT_FAILURE_THRESHOLD, RATE_LIMIT_COOLDOWN_SECONDS,
+            SESSION_CACHE_TTL_SECONDS, global_stats
+        )
+        return {"status": "success", "message": f"账户 {account_id} 已禁用", "account_count": len(multi_account_mgr.accounts)}
+    except Exception as e:
+        logger.error(f"[CONFIG] 禁用账户失败: {str(e)}")
+        raise HTTPException(500, f"禁用失败: {str(e)}")
+
+@app.put("/admin/accounts/{account_id}/enable")
+@require_login()
+async def admin_enable_account(request: Request, account_id: str):
+    """启用账户"""
+    global multi_account_mgr
+    try:
+        multi_account_mgr = _update_account_disabled_status(
+            account_id, False, multi_account_mgr, http_client, USER_AGENT,
+            ACCOUNT_FAILURE_THRESHOLD, RATE_LIMIT_COOLDOWN_SECONDS,
+            SESSION_CACHE_TTL_SECONDS, global_stats
+        )
+        return {"status": "success", "message": f"账户 {account_id} 已启用", "account_count": len(multi_account_mgr.accounts)}
+    except Exception as e:
+        logger.error(f"[CONFIG] 启用账户失败: {str(e)}")
+        raise HTTPException(500, f"启用失败: {str(e)}")
+
+@app.get("/admin/log")
+@require_login()
 async def admin_get_logs(
-    path_prefix: str,
+    request: Request,
     limit: int = 1500,
-    key: str = None,
-    authorization: str = Header(None),
     level: str = None,
     search: str = None,
     start_time: str = None,
     end_time: str = None
 ):
-    """
-    获取系统日志（包含统计信息）
-
-    参数:
-    - limit: 返回最近 N 条日志 (默认 1500, 最大 3000)
-    - level: 过滤日志级别 (INFO, WARNING, ERROR, DEBUG)
-    - search: 搜索关键词（在消息中搜索）
-    - start_time: 开始时间 (格式: 2025-12-17 10:00:00)
-    - end_time: 结束时间 (格式: 2025-12-17 11:00:00)
-    """
-    # 验证路径前缀
-    if path_prefix != PATH_PREFIX:
-        raise HTTPException(404, "Not Found")
-
-    # 验证管理员密钥
-    admin_key = key or (authorization.replace("Bearer ", "") if authorization and authorization.startswith("Bearer ") else authorization)
-    if admin_key != ADMIN_KEY:
-        raise HTTPException(404, "Not Found")
-
     with log_lock:
         logs = list(log_buffer)
 
-    # 计算统计信息（在过滤前）
     stats_by_level = {}
     error_logs = []
     chat_count = 0
     for log in logs:
         level_name = log.get("level", "INFO")
         stats_by_level[level_name] = stats_by_level.get(level_name, 0) + 1
-
-        # 收集错误日志
         if level_name in ["ERROR", "CRITICAL"]:
             error_logs.append(log)
-
-        # 统计对话次数（匹配包含"收到请求"的日志）
         if "收到请求" in log.get("message", ""):
             chat_count += 1
 
-    # 按级别过滤
     if level:
         level = level.upper()
         logs = [log for log in logs if log["level"] == level]
-
-    # 按关键词搜索
     if search:
         logs = [log for log in logs if search.lower() in log["message"].lower()]
-
-    # 按时间范围过滤
     if start_time:
         logs = [log for log in logs if log["time"] >= start_time]
     if end_time:
         logs = [log for log in logs if log["time"] <= end_time]
 
-    # 限制数量（返回最近的）
     limit = min(limit, 3000)
     filtered_logs = logs[-limit:]
 
     return {
         "total": len(filtered_logs),
         "limit": limit,
-        "filters": {
-            "level": level,
-            "search": search,
-            "start_time": start_time,
-            "end_time": end_time
-        },
+        "filters": {"level": level, "search": search, "start_time": start_time, "end_time": end_time},
         "logs": filtered_logs,
         "stats": {
-            "memory": {
-                "total": len(log_buffer),
-                "by_level": stats_by_level,
-                "capacity": log_buffer.maxlen
-            },
-            "errors": {
-                "count": len(error_logs),
-                "recent": error_logs[-10:]  # 最近10条错误
-            },
+            "memory": {"total": len(log_buffer), "by_level": stats_by_level, "capacity": log_buffer.maxlen},
+            "errors": {"count": len(error_logs), "recent": error_logs[-10:]},
             "chat_count": chat_count
         }
     }
 
-@app.delete("/{path_prefix}/admin/log")
-async def admin_clear_logs(path_prefix: str, confirm: str = None, key: str = None, authorization: str = Header(None)):
-    """
-    清空所有日志（内存缓冲 + 文件）
-
-    参数:
-    - confirm: 必须传入 "yes" 才能清空
-    """
-    # 验证路径前缀
-    if path_prefix != PATH_PREFIX:
-        raise HTTPException(404, "Not Found")
-
-    # 验证管理员密钥
-    admin_key = key or (authorization.replace("Bearer ", "") if authorization and authorization.startswith("Bearer ") else authorization)
-    if admin_key != ADMIN_KEY:
-        raise HTTPException(404, "Not Found")
-
+@app.delete("/admin/log")
+@require_login()
+async def admin_clear_logs(request: Request, confirm: str = None):
     if confirm != "yes":
-        raise HTTPException(
-            status_code=400,
-            detail="需要 confirm=yes 参数确认清空操作"
-        )
-
-    # 清空内存缓冲
+        raise HTTPException(400, "需要 confirm=yes 参数确认清空操作")
     with log_lock:
         cleared_count = len(log_buffer)
         log_buffer.clear()
-
     logger.info("[LOG] 日志已清空")
+    return {"status": "success", "message": "已清空内存日志", "cleared_count": cleared_count}
 
-    return {
-        "status": "success",
-        "message": "已清空内存日志",
-        "cleared_count": cleared_count
-    }
-
-@app.get("/{path_prefix}/admin/log/html")
-async def admin_logs_html(path_prefix: str, key: str = None, authorization: str = Header(None)):
+@app.get("/admin/log/html")
+@require_login()
+async def admin_logs_html_route(request: Request):
     """返回美化的 HTML 日志查看界面"""
-    # 验证路径前缀
-    if path_prefix != PATH_PREFIX:
-        raise HTTPException(404, "Not Found")
+    return await templates.admin_logs_html_no_auth(request)
 
-    # 验证管理员密钥
-    admin_key = key or (authorization.replace("Bearer ", "") if authorization and authorization.startswith("Bearer ") else authorization)
-    if admin_key != ADMIN_KEY:
-        raise HTTPException(404, "Not Found")
+# 带PATH_PREFIX的管理API端点（如果配置了PATH_PREFIX）
+if PATH_PREFIX:
+    @app.get(f"/{PATH_PREFIX}/health")
+    @require_login()
+    async def admin_health_prefixed(request: Request):
+        return await admin_health(request=request)
 
-    html_content = """
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <meta charset="utf-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <title>日志查看器</title>
-        <style>
-            * { margin: 0; padding: 0; box-sizing: border-box; }
-            html, body { height: 100%; overflow: hidden; }
-            body {
-                font-family: 'Consolas', 'Monaco', monospace;
-                background: #fafaf9;
-                display: flex;
-                align-items: center;
-                justify-content: center;
-                padding: 15px;
-            }
-            .container {
-                width: 100%;
-                max-width: 1400px;
-                height: calc(100vh - 30px);
-                background: white;
-                border-radius: 16px;
-                padding: 30px;
-                box-shadow: 0 2px 8px rgba(0,0,0,0.08);
-                display: flex;
-                flex-direction: column;
-            }
-            h1 { color: #1a1a1a; font-size: 22px; font-weight: 600; margin-bottom: 20px; text-align: center; }
-            .stats {
-                display: grid;
-                grid-template-columns: repeat(6, 1fr);
-                gap: 12px;
-                margin-bottom: 16px;
-            }
-            .stat {
-                background: #fafaf9;
-                padding: 12px;
-                border: 1px solid #e5e5e5;
-                border-radius: 8px;
-                text-align: center;
-                transition: all 0.15s ease;
-            }
-            .stat:hover { border-color: #d4d4d4; }
-            .stat-label { color: #6b6b6b; font-size: 11px; margin-bottom: 4px; }
-            .stat-value { color: #1a1a1a; font-size: 18px; font-weight: 600; }
-            .controls {
-                display: flex;
-                gap: 8px;
-                margin-bottom: 16px;
-                flex-wrap: wrap;
-            }
-            .controls input, .controls select, .controls button {
-                padding: 6px 10px;
-                border: 1px solid #e5e5e5;
-                border-radius: 8px;
-                font-size: 13px;
-            }
-            .controls select {
-                appearance: none;
-                -webkit-appearance: none;
-                -moz-appearance: none;
-                background-image: url("data:image/svg+xml,%3Csvg width='12' height='12' viewBox='0 0 12 12' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M3 5L6 8L9 5' stroke='%236b6b6b' stroke-width='1.5' stroke-linecap='round'/%3E%3C/svg%3E");
-                background-repeat: no-repeat;
-                background-position: right 12px center;
-                padding-right: 32px;
-            }
-            .controls input[type="text"] { flex: 1; min-width: 150px; }
-            .controls button {
-                background: #1a73e8;
-                color: white;
-                border: none;
-                cursor: pointer;
-                font-weight: 500;
-                transition: background 0.15s ease;
-                display: flex;
-                align-items: center;
-                gap: 6px;
-            }
-            .controls button:hover { background: #1557b0; }
-            .controls button.danger { background: #dc2626; }
-            .controls button.danger:hover { background: #b91c1c; }
-            .controls button svg { flex-shrink: 0; }
-            .log-container {
-                flex: 1;
-                background: #fafaf9;
-                border: 1px solid #e5e5e5;
-                border-radius: 8px;
-                padding: 12px;
-                overflow-y: auto;
-                scrollbar-width: thin;
-                scrollbar-color: rgba(0,0,0,0.15) transparent;
-            }
-            /* Webkit 滚动条样式 - 更窄且不占位 */
-            .log-container::-webkit-scrollbar {
-                width: 4px;
-            }
-            .log-container::-webkit-scrollbar-track {
-                background: transparent;
-            }
-            .log-container::-webkit-scrollbar-thumb {
-                background: rgba(0,0,0,0.15);
-                border-radius: 2px;
-            }
-            .log-container::-webkit-scrollbar-thumb:hover {
-                background: rgba(0,0,0,0.3);
-            }
-            .log-entry {
-                padding: 8px 10px;
-                margin-bottom: 4px;
-                background: white;
-                border-radius: 6px;
-                border: 1px solid #e5e5e5;
-                font-size: 12px;
-                color: #1a1a1a;
-                display: flex;
-                align-items: center;
-                gap: 8px;
-                word-break: break-word;
-            }
-            .log-entry > div:first-child {
-                display: flex;
-                align-items: center;
-                gap: 8px;
-            }
-            .log-message {
-                flex: 1;
-                overflow: hidden;
-                text-overflow: ellipsis;
-            }
-            .log-entry:hover { border-color: #d4d4d4; }
-            .log-time { color: #6b6b6b; }
-            .log-level {
-                display: flex;
-                align-items: center;
-                gap: 4px;
-                padding: 2px 6px;
-                border-radius: 3px;
-                font-size: 10px;
-                font-weight: 600;
-            }
-            .log-level::before {
-                content: '';
-                width: 6px;
-                height: 6px;
-                border-radius: 50%;
-            }
-            .log-level.INFO { background: #e3f2fd; color: #1976d2; }
-            .log-level.INFO::before { background: #1976d2; }
-            .log-level.WARNING { background: #fff3e0; color: #f57c00; }
-            .log-level.WARNING::before { background: #f57c00; }
-            .log-level.ERROR { background: #ffebee; color: #d32f2f; }
-            .log-level.ERROR::before { background: #d32f2f; }
-            .log-level.DEBUG { background: #f3e5f5; color: #7b1fa2; }
-            .log-level.DEBUG::before { background: #7b1fa2; }
-            .log-group {
-                margin-bottom: 8px;
-                border: 1px solid #e5e5e5;
-                border-radius: 8px;
-                background: white;
-            }
-            .log-group-header {
-                padding: 10px 12px;
-                background: #f9f9f9;
-                border-radius: 8px 8px 0 0;
-                cursor: pointer;
-                display: flex;
-                align-items: center;
-                gap: 8px;
-                transition: background 0.15s ease;
-            }
-            .log-group-header:hover {
-                background: #f0f0f0;
-            }
-            .log-group-content {
-                padding: 8px;
-            }
-            .log-group .log-entry {
-                margin-bottom: 4px;
-            }
-            .log-group .log-entry:last-child {
-                margin-bottom: 0;
-            }
-            .toggle-icon {
-                display: inline-block;
-                transition: transform 0.2s ease;
-            }
-            .toggle-icon.collapsed {
-                transform: rotate(-90deg);
-            }
-            @media (max-width: 768px) {
-                body { padding: 0; }
-                .container { padding: 15px; height: 100vh; border-radius: 0; max-width: 100%; }
-                h1 { font-size: 18px; margin-bottom: 12px; }
-                .stats { grid-template-columns: repeat(3, 1fr); gap: 8px; }
-                .stat { padding: 8px; }
-                .controls { gap: 6px; }
-                .controls input, .controls select { min-height: 38px; }
-                .controls select { flex: 0 0 auto; }
-                .controls input[type="text"] { flex: 1 1 auto; min-width: 80px; }
-                .controls input[type="number"] { flex: 0 0 60px; }
-                .controls button { padding: 10px 8px; font-size: 12px; flex: 1 1 22%; justify-content: center; min-height: 38px; }
-                .log-entry {
-                    font-size: 12px;
-                    padding: 10px;
-                    gap: 8px;
-                    flex-direction: column;
-                    align-items: flex-start;
-                }
-                .log-entry > div:first-child {
-                    display: flex;
-                    align-items: center;
-                    gap: 6px;
-                    width: 100%;
-                    flex-wrap: wrap;
-                }
-                .log-time { font-size: 11px; color: #9e9e9e; }
-                .log-level { font-size: 10px; }
-                .log-message {
-                    width: 100%;
-                    white-space: normal;
-                    word-break: break-word;
-                    line-height: 1.5;
-                    margin-top: 4px;
-                }
-            }
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <h1>Gemini API 日志查看器</h1>
-            <div class="stats">
-                <div class="stat">
-                    <div class="stat-label">总数</div>
-                    <div class="stat-value" id="total-count">-</div>
-                </div>
-                <div class="stat">
-                    <div class="stat-label">对话</div>
-                    <div class="stat-value" id="chat-count">-</div>
-                </div>
-                <div class="stat">
-                    <div class="stat-label">INFO</div>
-                    <div class="stat-value" id="info-count">-</div>
-                </div>
-                <div class="stat">
-                    <div class="stat-label">WARNING</div>
-                    <div class="stat-value" id="warning-count">-</div>
-                </div>
-                <div class="stat">
-                    <div class="stat-label">ERROR</div>
-                    <div class="stat-value" id="error-count">-</div>
-                </div>
-                <div class="stat">
-                    <div class="stat-label">更新</div>
-                    <div class="stat-value" id="last-update" style="font-size: 11px;">-</div>
-                </div>
-            </div>
-            <div class="controls">
-                <select id="level-filter">
-                    <option value="">全部</option>
-                    <option value="INFO">INFO</option>
-                    <option value="WARNING">WARNING</option>
-                    <option value="ERROR">ERROR</option>
-                </select>
-                <input type="text" id="search-input" placeholder="搜索...">
-                <input type="number" id="limit-input" value="1500" min="10" max="3000" step="100" style="width: 80px;">
-                <button onclick="loadLogs()">
-                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                        <circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/>
-                    </svg>
-                    查询
-                </button>
-                <button onclick="exportJSON()">
-                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>
-                    </svg>
-                    导出
-                </button>
-                <button id="auto-refresh-btn" onclick="toggleAutoRefresh()">
-                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                        <polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
-                    </svg>
-                    自动刷新
-                </button>
-                <button onclick="clearAllLogs()" class="danger">
-                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                        <polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
-                    </svg>
-                    清空
-                </button>
-            </div>
-            <div class="log-container" id="log-container">
-                <div style="color: #6b6b6b;">正在加载...</div>
-            </div>
-        </div>
-        <script>
-            let autoRefreshTimer = null;
-            async function loadLogs() {
-                const level = document.getElementById('level-filter').value;
-                const search = document.getElementById('search-input').value;
-                const limit = document.getElementById('limit-input').value;
-                // 从当前 URL 获取 key 参数
-                const urlParams = new URLSearchParams(window.location.search);
-                const key = urlParams.get('key');
-                // 构建 API URL（使用当前路径的前缀）
-                const pathPrefix = window.location.pathname.split('/')[1];
-                let url = `/${pathPrefix}/admin/log?limit=${limit}`;
-                if (key) url += `&key=${key}`;
-                if (level) url += `&level=${level}`;
-                if (search) url += `&search=${encodeURIComponent(search)}`;
-                try {
-                    const response = await fetch(url);
-                    if (!response.ok) {
-                        throw new Error(`HTTP ${response.status}`);
-                    }
-                    const data = await response.json();
-                    if (data && data.logs) {
-                        displayLogs(data.logs);
-                        updateStats(data.stats);
-                        document.getElementById('last-update').textContent = new Date().toLocaleTimeString('zh-CN', {hour: '2-digit', minute: '2-digit'});
-                    } else {
-                        throw new Error('Invalid data format');
-                    }
-                } catch (error) {
-                    document.getElementById('log-container').innerHTML = '<div class="log-entry ERROR">加载失败: ' + error.message + '</div>';
-                }
-            }
-            function updateStats(stats) {
-                document.getElementById('total-count').textContent = stats.memory.total;
-                document.getElementById('info-count').textContent = stats.memory.by_level.INFO || 0;
-                document.getElementById('warning-count').textContent = stats.memory.by_level.WARNING || 0;
-                const errorCount = document.getElementById('error-count');
-                errorCount.textContent = stats.memory.by_level.ERROR || 0;
-                if (stats.errors && stats.errors.count > 0) errorCount.style.color = '#dc2626';
-                document.getElementById('chat-count').textContent = stats.chat_count || 0;
-            }
-            // 分类颜色配置（提取到外部避免重复定义）
-            const CATEGORY_COLORS = {
-                'SYSTEM': '#9e9e9e',
-                'CONFIG': '#607d8b',
-                'LOG': '#9e9e9e',
-                'AUTH': '#4caf50',
-                'SESSION': '#00bcd4',
-                'FILE': '#ff9800',
-                'CHAT': '#2196f3',
-                'API': '#8bc34a',
-                'CACHE': '#9c27b0',
-                'ACCOUNT': '#f44336',
-                'MULTI': '#673ab7'
-            };
+    @app.get(f"/{PATH_PREFIX}/accounts")
+    @require_login()
+    async def admin_get_accounts_prefixed(request: Request):
+        return await admin_get_accounts(request=request)
 
-            // 账户颜色配置（提取到外部避免重复定义）
-            const ACCOUNT_COLORS = {
-                'account_1': '#9c27b0',
-                'account_2': '#e91e63',
-                'account_3': '#00bcd4',
-                'account_4': '#4caf50',
-                'account_5': '#ff9800'
-            };
+    @app.get(f"/{PATH_PREFIX}/accounts-config")
+    @require_login()
+    async def admin_get_config_prefixed(request: Request):
+        return await admin_get_config(request=request)
 
-            function getCategoryColor(category) {
-                return CATEGORY_COLORS[category] || '#757575';
-            }
+    @app.put(f"/{PATH_PREFIX}/accounts-config")
+    @require_login()
+    async def admin_update_config_prefixed(request: Request, accounts_data: list = Body(...)):
+        return await admin_update_config(request=request, accounts_data=accounts_data)
 
-            function getAccountColor(accountId) {
-                return ACCOUNT_COLORS[accountId] || '#757575';
-            }
+    @app.delete(f"/{PATH_PREFIX}/accounts/{{account_id}}")
+    @require_login()
+    async def admin_delete_account_prefixed(request: Request, account_id: str):
+        return await admin_delete_account(request=request, account_id=account_id)
 
-            function displayLogs(logs) {
-                const container = document.getElementById('log-container');
-                if (logs.length === 0) {
-                    container.innerHTML = '<div class="log-entry">暂无日志</div>';
-                    return;
-                }
+    @app.put(f"/{PATH_PREFIX}/accounts/{{account_id}}/disable")
+    @require_login()
+    async def admin_disable_account_prefixed(request: Request, account_id: str):
+        return await admin_disable_account(request=request, account_id=account_id)
 
-                // 按请求ID分组
-                const groups = {};
-                const ungrouped = [];
+    @app.put(f"/{PATH_PREFIX}/accounts/{{account_id}}/enable")
+    @require_login()
+    async def admin_enable_account_prefixed(request: Request, account_id: str):
+        return await admin_enable_account(request=request, account_id=account_id)
 
-                logs.forEach(log => {
-                    const msg = escapeHtml(log.message);
-                    const reqMatch = msg.match(/\[req_([a-z0-9]+)\]/);
+    @app.get(f"/{PATH_PREFIX}/log")
+    @require_login()
+    async def admin_get_logs_prefixed(
+        request: Request,
+        limit: int = 1500,
+        level: str = None,
+        search: str = None,
+        start_time: str = None,
+        end_time: str = None
+    ):
+        return await admin_get_logs(request=request, limit=limit, level=level, search=search, start_time=start_time, end_time=end_time)
 
-                    if (reqMatch) {
-                        const reqId = reqMatch[1];
-                        if (!groups[reqId]) {
-                            groups[reqId] = [];
-                        }
-                        groups[reqId].push(log);
-                    } else {
-                        ungrouped.push(log);
-                    }
-                });
+    @app.delete(f"/{PATH_PREFIX}/log")
+    @require_login()
+    async def admin_clear_logs_prefixed(request: Request, confirm: str = None):
+        return await admin_clear_logs(request=request, confirm=confirm)
 
-                // 渲染分组
-                let html = '';
+    @app.get(f"/{PATH_PREFIX}/log/html")
+    @require_login()
+    async def admin_logs_html_route_prefixed(request: Request):
+        return await admin_logs_html_route(request=request)
 
-                // 先渲染未分组的日志
-                ungrouped.forEach(log => {
-                    html += renderLogEntry(log);
-                });
+# ---------- API端点（API Key认证） ----------
 
-                // 读取折叠状态
-                const foldState = JSON.parse(localStorage.getItem('log-fold-state') || '{}');
+@app.get("/v1/models")
+async def list_models(authorization: str = Header(None)):
+    verify_api_key(API_KEY, authorization)
+    data = []
+    now = int(time.time())
+    for m in MODEL_MAPPING.keys():
+        data.append({"id": m, "object": "model", "created": now, "owned_by": "google", "permission": []})
+    return {"object": "list", "data": data}
 
-                // 按请求ID分组渲染（最新的组在下面）
-                Object.keys(groups).forEach(reqId => {
-                    const groupLogs = groups[reqId];
-                    const firstLog = groupLogs[0];
-                    const lastLog = groupLogs[groupLogs.length - 1];
+@app.get("/v1/models/{model_id}")
+async def get_model(model_id: str, authorization: str = Header(None)):
+    verify_api_key(API_KEY, authorization)
+    return {"id": model_id, "object": "model"}
 
-                    // 判断状态
-                    let status = 'in_progress';
-                    let statusColor = '#ff9800';
-                    let statusText = '进行中';
+# 带PATH_PREFIX的API端点（如果配置了PATH_PREFIX）
+if PATH_PREFIX:
+    @app.get(f"/{PATH_PREFIX}/v1/models")
+    async def list_models_prefixed(authorization: str = Header(None)):
+        return await list_models(authorization)
 
-                    if (lastLog.message.includes('响应完成') || lastLog.message.includes('非流式响应完成')) {
-                        status = 'success';
-                        statusColor = '#4caf50';
-                        statusText = '成功';
-                    } else if (lastLog.level === 'ERROR' || lastLog.message.includes('失败')) {
-                        status = 'error';
-                        statusColor = '#f44336';
-                        statusText = '失败';
-                    } else {
-                        // 检查超时（最后日志超过 5 分钟）
-                        const lastLogTime = new Date(lastLog.time);
-                        const now = new Date();
-                        const diffMinutes = (now - lastLogTime) / 1000 / 60;
-                        if (diffMinutes > 5) {
-                            status = 'timeout';
-                            statusColor = '#ffc107';
-                            statusText = '超时';
-                        }
-                    }
+    @app.get(f"/{PATH_PREFIX}/v1/models/{{model_id}}")
+    async def get_model_prefixed(model_id: str, authorization: str = Header(None)):
+        return await get_model(model_id, authorization)
 
-                    // 提取账户ID和模型
-                    const accountMatch = firstLog.message.match(/\[account_(\d+)\]/);
-                    const modelMatch = firstLog.message.match(/收到请求: ([^ ]+)/);
-                    const accountId = accountMatch ? `account_${accountMatch[1]}` : '';
-                    const model = modelMatch ? modelMatch[1] : '';
+# ---------- 聊天API端点 ----------
 
-                    // 检查折叠状态
-                    const isCollapsed = foldState[reqId] === true;
-                    const contentStyle = isCollapsed ? 'style="display: none;"' : '';
-                    const iconClass = isCollapsed ? 'class="toggle-icon collapsed"' : 'class="toggle-icon"';
-
-                    html += `
-                        <div class="log-group" data-req-id="${reqId}">
-                            <div class="log-group-header" onclick="toggleGroup('${reqId}')">
-                                <span style="color: ${statusColor}; font-weight: 600; font-size: 11px;">⬤ ${statusText}</span>
-                                <span style="color: #666; font-size: 11px; margin-left: 8px;">req_${reqId}</span>
-                                ${accountId ? `<span style="color: ${getAccountColor(accountId)}; font-size: 11px; margin-left: 8px;">${accountId}</span>` : ''}
-                                ${model ? `<span style="color: #999; font-size: 11px; margin-left: 8px;">${model}</span>` : ''}
-                                <span style="color: #999; font-size: 11px; margin-left: 8px;">${groupLogs.length}条日志</span>
-                                <span ${iconClass} style="margin-left: auto; color: #999;">▼</span>
-                            </div>
-                            <div class="log-group-content" ${contentStyle}>
-                                ${groupLogs.map(log => renderLogEntry(log)).join('')}
-                            </div>
-                        </div>
-                    `;
-                });
-
-                container.innerHTML = html;
-
-                // 自动滚动到底部，显示最新日志
-                container.scrollTop = container.scrollHeight;
-            }
-
-            function renderLogEntry(log) {
-                const msg = escapeHtml(log.message);
-                let displayMsg = msg;
-                let categoryTags = [];
-                let accountId = null;
-
-                // 解析所有标签：[CATEGORY1] [CATEGORY2] [account_X] [req_X] message
-                let remainingMsg = msg;
-                const tagRegex = /^\[([A-Z_a-z0-9]+)\]/;
-
-                while (true) {
-                    const match = remainingMsg.match(tagRegex);
-                    if (!match) break;
-
-                    const tag = match[1];
-                    remainingMsg = remainingMsg.substring(match[0].length).trim();
-
-                    // 跳过req_标签（已在组头部显示）
-                    if (tag.startsWith('req_')) {
-                        continue;
-                    }
-                    // 判断是否为账户ID
-                    else if (tag.startsWith('account_')) {
-                        accountId = tag;
-                    } else {
-                        // 普通分类标签
-                        categoryTags.push(tag);
-                    }
-                }
-
-                displayMsg = remainingMsg;
-
-                // 生成分类标签HTML
-                const categoryTagsHtml = categoryTags.map(cat =>
-                    `<span class="log-category" style="background: ${getCategoryColor(cat)}; color: white; padding: 2px 6px; border-radius: 3px; font-size: 10px; font-weight: 600; margin-left: 2px;">${cat}</span>`
-                ).join('');
-
-                // 生成账户标签HTML
-                const accountTagHtml = accountId
-                    ? `<span style="color: ${getAccountColor(accountId)}; font-size: 11px; font-weight: 600; margin-left: 2px;">${accountId}</span>`
-                    : '';
-
-                return `
-                    <div class="log-entry ${log.level}">
-                        <div>
-                            <span class="log-time">${log.time}</span>
-                            <span class="log-level ${log.level}">${log.level}</span>
-                            ${categoryTagsHtml}
-                            ${accountTagHtml}
-                        </div>
-                        <div class="log-message">${displayMsg}</div>
-                    </div>
-                `;
-            }
-
-            function toggleGroup(reqId) {
-                const group = document.querySelector(`.log-group[data-req-id="${reqId}"]`);
-                const content = group.querySelector('.log-group-content');
-                const icon = group.querySelector('.toggle-icon');
-
-                const isCollapsed = content.style.display === 'none';
-                if (isCollapsed) {
-                    content.style.display = 'block';
-                    icon.classList.remove('collapsed');
-                } else {
-                    content.style.display = 'none';
-                    icon.classList.add('collapsed');
-                }
-
-                // 保存折叠状态到 localStorage
-                const foldState = JSON.parse(localStorage.getItem('log-fold-state') || '{}');
-                foldState[reqId] = !isCollapsed;
-                localStorage.setItem('log-fold-state', JSON.stringify(foldState));
-            }
-            function escapeHtml(text) {
-                const div = document.createElement('div');
-                div.textContent = text;
-                return div.innerHTML;
-            }
-            async function exportJSON() {
-                try {
-                    const urlParams = new URLSearchParams(window.location.search);
-                    const key = urlParams.get('key');
-                    const pathPrefix = window.location.pathname.split('/')[1];
-                    let url = `/${pathPrefix}/admin/log?limit=3000`;
-                    if (key) url += `&key=${key}`;
-                    const response = await fetch(url);
-                    const data = await response.json();
-                    const blob = new Blob([JSON.stringify({exported_at: new Date().toISOString(), logs: data.logs}, null, 2)], {type: 'application/json'});
-                    const blobUrl = URL.createObjectURL(blob);
-                    const a = document.createElement('a');
-                    a.href = blobUrl;
-                    a.download = 'logs_' + new Date().toISOString().slice(0, 19).replace(/:/g, '-') + '.json';
-                    a.click();
-                    URL.revokeObjectURL(blobUrl);
-                    alert('导出成功');
-                } catch (error) {
-                    alert('导出失败: ' + error.message);
-                }
-            }
-            async function clearAllLogs() {
-                if (!confirm('确定清空所有日志？')) return;
-                try {
-                    const urlParams = new URLSearchParams(window.location.search);
-                    const key = urlParams.get('key');
-                    const pathPrefix = window.location.pathname.split('/')[1];
-                    let url = `/${pathPrefix}/admin/log?confirm=yes`;
-                    if (key) url += `&key=${key}`;
-                    const response = await fetch(url, {method: 'DELETE'});
-                    if (response.ok) {
-                        alert('已清空');
-                        loadLogs();
-                    } else {
-                        alert('清空失败');
-                    }
-                } catch (error) {
-                    alert('清空失败: ' + error.message);
-                }
-            }
-            let autoRefreshEnabled = true;
-            function toggleAutoRefresh() {
-                autoRefreshEnabled = !autoRefreshEnabled;
-                const btn = document.getElementById('auto-refresh-btn');
-                if (autoRefreshEnabled) {
-                    btn.style.background = '#1a73e8';
-                    autoRefreshTimer = setInterval(loadLogs, 5000);
-                } else {
-                    btn.style.background = '#6b6b6b';
-                    if (autoRefreshTimer) {
-                        clearInterval(autoRefreshTimer);
-                        autoRefreshTimer = null;
-                    }
-                }
-            }
-            document.addEventListener('DOMContentLoaded', () => {
-                loadLogs();
-                autoRefreshTimer = setInterval(loadLogs, 5000);
-                document.getElementById('search-input').addEventListener('keypress', (e) => {
-                    if (e.key === 'Enter') loadLogs();
-                });
-                document.getElementById('level-filter').addEventListener('change', loadLogs);
-                document.getElementById('limit-input').addEventListener('change', loadLogs);
-            });
-        </script>
-    </body>
-    </html>
-    """
-    return HTMLResponse(content=html_content)
-
-@app.post("/{path_prefix}/v1/chat/completions")
+@app.post("/v1/chat/completions")
 async def chat(
-    path_prefix: str,
     req: ChatRequest,
     request: Request,
     authorization: Optional[str] = Header(None)
 ):
-    # 0. 验证路径前缀
-    if path_prefix != PATH_PREFIX:
-        raise HTTPException(404, "Not Found")
+    # API Key 验证
+    verify_api_key(API_KEY, authorization)
+    # ... (保留原有的chat逻辑)
+    return await chat_impl(req, request, authorization)
 
-    # 1. API Key 验证
-    verify_api_key(authorization)
+if PATH_PREFIX:
+    @app.post(f"/{PATH_PREFIX}/v1/chat/completions")
+    async def chat_prefixed(
+        req: ChatRequest,
+        request: Request,
+        authorization: Optional[str] = Header(None)
+    ):
+        return await chat(req, request, authorization)
 
-    # 1. 生成请求ID（最优先，用于所有日志追踪）
+# chat实现函数
+async def chat_impl(
+    req: ChatRequest,
+    request: Request,
+    authorization: Optional[str]
+):
+    # 生成请求ID（最优先，用于所有日志追踪）
     request_id = str(uuid.uuid4())[:6]
 
+    # 获取客户端IP（用于会话隔离）
+    client_ip = request.headers.get("x-forwarded-for")
+    if client_ip:
+        client_ip = client_ip.split(",")[0].strip()
+    else:
+        client_ip = request.client.host if request.client else "unknown"
+
     # 记录请求统计
-    with stats_lock:
+    async with stats_lock:
         global_stats["total_requests"] += 1
         global_stats["request_timestamps"].append(time.time())
-        save_stats(global_stats)
+        await save_stats(global_stats)
 
     # 2. 模型校验
     if req.model not in MODEL_MAPPING:
@@ -2232,45 +939,56 @@ async def chat(
             detail=f"Model '{req.model}' not found. Available models: {list(MODEL_MAPPING.keys())}"
         )
 
-    # 3. 生成会话指纹，检查是否已有绑定的账户
-    conv_key = get_conversation_key([m.dict() for m in req.messages])
-    cached_session = multi_account_mgr.global_session_cache.get(conv_key)
+    # 保存模型信息到 request.state（用于 Uptime 追踪）
+    request.state.model = req.model
 
-    if cached_session:
-        # 使用已绑定的账户
-        account_id = cached_session["account_id"]
-        account_manager = await multi_account_mgr.get_account(account_id, request_id)
-        google_session = cached_session["session_id"]
-        is_new_conversation = False
-        logger.info(f"[CHAT] [{account_id}] [req_{request_id}] 继续会话: {google_session[-12:]}")
-    else:
-        # 新对话：轮询选择可用账户，失败时尝试其他账户
-        max_account_tries = min(MAX_NEW_SESSION_TRIES, len(multi_account_mgr.accounts))
-        last_error = None
+    # 3. 生成会话指纹，获取Session锁（防止同一对话的并发请求冲突）
+    conv_key = get_conversation_key([m.model_dump() for m in req.messages], client_ip)
+    session_lock = await multi_account_mgr.acquire_session_lock(conv_key)
 
-        for attempt in range(max_account_tries):
-            try:
-                account_manager = await multi_account_mgr.get_account(None, request_id)
-                google_session = await create_google_session(account_manager, request_id)
-                # 线程安全地绑定账户到此对话
-                await multi_account_mgr.set_session_cache(
-                    conv_key,
-                    account_manager.config.account_id,
-                    google_session
-                )
-                is_new_conversation = True
-                logger.info(f"[CHAT] [{account_manager.config.account_id}] [req_{request_id}] 新会话创建并绑定账户")
-                break
-            except Exception as e:
-                last_error = e
-                error_type = type(e).__name__
-                # 安全获取账户ID
-                account_id = account_manager.config.account_id if 'account_manager' in locals() and account_manager else 'unknown'
-                logger.error(f"[CHAT] [req_{request_id}] 账户 {account_id} 创建会话失败 (尝试 {attempt + 1}/{max_account_tries}) - {error_type}: {str(e)}")
-                if attempt == max_account_tries - 1:
-                    logger.error(f"[CHAT] [req_{request_id}] 所有账户均不可用")
-                    raise HTTPException(503, f"All accounts unavailable: {str(last_error)[:100]}")
-                # 继续尝试下一个账户
+    # 4. 在锁的保护下检查缓存和处理Session（保证同一对话的请求串行化）
+    async with session_lock:
+        cached_session = multi_account_mgr.global_session_cache.get(conv_key)
+
+        if cached_session:
+            # 使用已绑定的账户
+            account_id = cached_session["account_id"]
+            account_manager = await multi_account_mgr.get_account(account_id, request_id)
+            google_session = cached_session["session_id"]
+            is_new_conversation = False
+            logger.info(f"[CHAT] [{account_id}] [req_{request_id}] 继续会话: {google_session[-12:]}")
+        else:
+            # 新对话：轮询选择可用账户，失败时尝试其他账户
+            max_account_tries = min(MAX_NEW_SESSION_TRIES, len(multi_account_mgr.accounts))
+            last_error = None
+
+            for attempt in range(max_account_tries):
+                try:
+                    account_manager = await multi_account_mgr.get_account(None, request_id)
+                    google_session = await create_google_session(account_manager, http_client, USER_AGENT, request_id)
+                    # 线程安全地绑定账户到此对话
+                    await multi_account_mgr.set_session_cache(
+                        conv_key,
+                        account_manager.config.account_id,
+                        google_session
+                    )
+                    is_new_conversation = True
+                    logger.info(f"[CHAT] [{account_manager.config.account_id}] [req_{request_id}] 新会话创建并绑定账户")
+                    # 记录账号池状态（账户可用）
+                    uptime_tracker.record_request("account_pool", True)
+                    break
+                except Exception as e:
+                    last_error = e
+                    error_type = type(e).__name__
+                    # 安全获取账户ID
+                    account_id = account_manager.config.account_id if 'account_manager' in locals() and account_manager else 'unknown'
+                    logger.error(f"[CHAT] [req_{request_id}] 账户 {account_id} 创建会话失败 (尝试 {attempt + 1}/{max_account_tries}) - {error_type}: {str(e)}")
+                    # 记录账号池状态（单个账户失败）
+                    uptime_tracker.record_request("account_pool", False)
+                    if attempt == max_account_tries - 1:
+                        logger.error(f"[CHAT] [req_{request_id}] 所有账户均不可用")
+                        raise HTTPException(503, f"All accounts unavailable: {str(last_error)[:100]}")
+                    # 继续尝试下一个账户
 
     # 提取用户消息内容用于日志
     if req.messages:
@@ -2293,7 +1011,7 @@ async def chat(
     logger.info(f"[CHAT] [{account_manager.config.account_id}] [req_{request_id}] 用户消息: {preview}")
 
     # 3. 解析请求内容
-    last_text, current_images = parse_last_message(req.messages)
+    last_text, current_images = await parse_last_message(req.messages, http_client, request_id)
 
     # 4. 准备文本内容
     if is_new_conversation:
@@ -2333,7 +1051,7 @@ async def chat(
                 cached = multi_account_mgr.global_session_cache.get(conv_key)
                 if not cached:
                     logger.warning(f"[CHAT] [{account_manager.config.account_id}] [req_{request_id}] 缓存已清理，重建Session")
-                    new_sess = await create_google_session(account_manager, request_id)
+                    new_sess = await create_google_session(account_manager, http_client, USER_AGENT, request_id)
                     await multi_account_mgr.set_session_cache(
                         conv_key,
                         account_manager.config.account_id,
@@ -2349,7 +1067,7 @@ async def chat(
                 # 注意：每次重试如果是新 Session，都需要重新上传图片
                 if current_images and not current_file_ids:
                     for img in current_images:
-                        fid = await upload_context_file(current_session, img["mime"], img["data"], account_manager, request_id)
+                        fid = await upload_context_file(current_session, img["mime"], img["data"], account_manager, http_client, USER_AGENT, request_id)
                         current_file_ids.append(fid)
 
                 # B. 准备文本 (重试模式下发全文)
@@ -2370,11 +1088,46 @@ async def chat(
                     request
                 ):
                     yield chunk
+
+                # 请求成功，重置账户失败计数
+                account_manager.is_available = True
+                account_manager.error_count = 0
+                account_manager.conversation_count += 1  # 增加对话次数
+
+                # 记录账号池状态（请求成功）
+                uptime_tracker.record_request("account_pool", True)
+
+                # 保存对话次数到统计数据
+                async with stats_lock:
+                    if "account_conversations" not in global_stats:
+                        global_stats["account_conversations"] = {}
+                    global_stats["account_conversations"][account_manager.config.account_id] = account_manager.conversation_count
+                    await save_stats(global_stats)
+
                 break
 
-            except (httpx.ConnectError, httpx.ReadTimeout, ssl.SSLError, HTTPException) as e:
+            except (httpx.HTTPError, ssl.SSLError, HTTPException) as e:
                 # 记录当前失败的账户
                 failed_accounts.add(account_manager.config.account_id)
+
+                # 记录账号池状态（请求失败）
+                uptime_tracker.record_request("account_pool", False)
+
+                # 检查是否为429错误（Rate Limit）
+                is_rate_limit = isinstance(e, HTTPException) and e.status_code == 429
+
+                # 增加账户失败计数（触发熔断机制）
+                account_manager.last_error_time = time.time()
+                if is_rate_limit:
+                    account_manager.last_429_time = time.time()
+
+                account_manager.error_count += 1
+                if account_manager.error_count >= ACCOUNT_FAILURE_THRESHOLD:
+                    account_manager.is_available = False
+                    if is_rate_limit:
+                        logger.error(f"[ACCOUNT] [{account_manager.config.account_id}] [req_{request_id}] 遇到429错误{account_manager.error_count}次，账户已禁用（需休息{RATE_LIMIT_COOLDOWN_SECONDS}秒）")
+                    else:
+                        logger.error(f"[ACCOUNT] [{account_manager.config.account_id}] [req_{request_id}] 请求连续失败{account_manager.error_count}次，账户已永久禁用")
 
                 retry_count += 1
 
@@ -2384,7 +1137,10 @@ async def chat(
 
                 # 特殊处理HTTPException，提取状态码和详情
                 if isinstance(e, HTTPException):
-                    logger.error(f"[CHAT] [{account_manager.config.account_id}] [req_{request_id}] HTTP错误 {e.status_code}: {e.detail}")
+                    if is_rate_limit:
+                        logger.error(f"[CHAT] [{account_manager.config.account_id}] [req_{request_id}] 遇到429限流错误，账户将休息{RATE_LIMIT_COOLDOWN_SECONDS}秒")
+                    else:
+                        logger.error(f"[CHAT] [{account_manager.config.account_id}] [req_{request_id}] HTTP错误 {e.status_code}: {e.detail}")
                 else:
                     logger.error(f"[CHAT] [{account_manager.config.account_id}] [req_{request_id}] {error_type}: {error_detail}")
 
@@ -2411,7 +1167,7 @@ async def chat(
                         logger.info(f"[CHAT] [req_{request_id}] 切换账户: {account_manager.config.account_id} -> {new_account.config.account_id}")
 
                         # 创建新 Session
-                        new_sess = await create_google_session(new_account, request_id)
+                        new_sess = await create_google_session(new_account, http_client, USER_AGENT, request_id)
 
                         # 更新缓存绑定到新账户
                         await multi_account_mgr.set_session_cache(
@@ -2430,6 +1186,8 @@ async def chat(
                     except Exception as create_err:
                         error_type = type(create_err).__name__
                         logger.error(f"[CHAT] [req_{request_id}] 账户切换失败 ({error_type}): {str(create_err)}")
+                        # 记录账号池状态（账户切换失败）
+                        uptime_tracker.record_request("account_pool", False)
                         if req.stream: yield f"data: {json.dumps({'error': {'message': 'Account Failover Failed'}})}\n\n"
                         return
                 else:
@@ -2493,7 +1251,7 @@ def parse_images_from_response(data_list: list) -> tuple[list, str]:
         if not sar:
             continue
 
-        # 获取session信息
+        # 获取session信息（优先使用最新的）
         session_info = sar.get("sessionInfo", {})
         if session_info.get("session"):
             session_name = session_info["session"]
@@ -2507,100 +1265,14 @@ def parse_images_from_response(data_list: list) -> tuple[list, str]:
 
             # 检查file字段（图片生成的关键）
             file_info = content.get("file")
-            if file_info:
-                logger.info(f"[IMAGE] [DEBUG] 发现file字段: {file_info}")
-                if file_info.get("fileId"):
-                    file_ids.append({
-                        "fileId": file_info["fileId"],
-                        "mimeType": file_info.get("mimeType", "image/png")
-                    })
+            if file_info and file_info.get("fileId"):
+                file_ids.append({
+                    "fileId": file_info["fileId"],
+                    "mimeType": file_info.get("mimeType", "image/png")
+                })
 
     return file_ids, session_name
 
-
-async def get_session_file_metadata(account_mgr: AccountManager, session_name: str, request_id: str = "") -> dict:
-    """获取session中的文件元数据，包括正确的session路径"""
-    jwt = await account_mgr.get_jwt(request_id)
-    headers = get_common_headers(jwt)
-    body = {
-        "configId": account_mgr.config.config_id,
-        "additionalParams": {"token": "-"},
-        "listSessionFileMetadataRequest": {
-            "name": session_name,
-            "filter": "file_origin_type = AI_GENERATED"
-        }
-    }
-
-    resp = await http_client.post(
-        "https://biz-discoveryengine.googleapis.com/v1alpha/locations/global/widgetListSessionFileMetadata",
-        headers=headers,
-        json=body
-    )
-
-    if resp.status_code == 401:
-        # JWT过期，刷新后重试
-        jwt = await account_mgr.get_jwt(request_id)
-        headers = get_common_headers(jwt)
-        resp = await http_client.post(
-            "https://biz-discoveryengine.googleapis.com/v1alpha/locations/global/widgetListSessionFileMetadata",
-            headers=headers,
-            json=body
-        )
-
-    if resp.status_code != 200:
-        logger.warning(f"[IMAGE] [{account_mgr.config.account_id}] [req_{request_id}] 获取文件元数据失败: {resp.status_code}")
-        return {}
-
-    data = resp.json()
-    result = {}
-    file_metadata_list = data.get("listSessionFileMetadataResponse", {}).get("fileMetadata", [])
-    for fm in file_metadata_list:
-        fid = fm.get("fileId")
-        if fid:
-            result[fid] = fm
-
-    return result
-
-
-def build_image_download_url(session_name: str, file_id: str) -> str:
-    """构造图片下载URL"""
-    return f"https://biz-discoveryengine.googleapis.com/v1alpha/{session_name}:downloadFile?fileId={file_id}&alt=media"
-
-
-async def download_image_with_jwt(account_mgr: AccountManager, session_name: str, file_id: str, request_id: str = "") -> bytes:
-    """使用JWT认证下载图片"""
-    url = build_image_download_url(session_name, file_id)
-    logger.info(f"[IMAGE] [DEBUG] 下载URL: {url}")
-    logger.info(f"[IMAGE] [DEBUG] Session完整路径: {session_name}")
-    jwt = await account_mgr.get_jwt(request_id)
-    headers = get_common_headers(jwt)
-
-    # 复用全局http_client
-    resp = await http_client.get(url, headers=headers, follow_redirects=True)
-
-    if resp.status_code == 401:
-        # JWT过期，刷新后重试
-        jwt = await account_mgr.get_jwt(request_id)
-        headers = get_common_headers(jwt)
-        resp = await http_client.get(url, headers=headers, follow_redirects=True)
-
-    resp.raise_for_status()
-    return resp.content
-
-
-def save_image_to_hf(image_data: bytes, chat_id: str, file_id: str, mime_type: str, base_url: str) -> str:
-    """保存图片到持久化存储,返回完整的公开URL"""
-    ext_map = {"image/png": ".png", "image/jpeg": ".jpg", "image/gif": ".gif", "image/webp": ".webp"}
-    ext = ext_map.get(mime_type, ".png")
-
-    filename = f"{chat_id}_{file_id}{ext}"
-    save_path = os.path.join(IMAGE_DIR, filename)
-
-    # 目录已在启动时创建(Line 635),无需重复创建
-    with open(save_path, "wb") as f:
-        f.write(image_data)
-
-    return f"{base_url}/images/{filename}"
 
 async def stream_chat_generator(session: str, text_content: str, file_ids: List[str], model_name: str, chat_id: str, created_time: int, account_manager: AccountManager, is_stream: bool = True, request_id: str = "", request: Request = None):
     start_time = time.time()
@@ -2612,7 +1284,7 @@ async def stream_chat_generator(session: str, text_content: str, file_ids: List[
         logger.info(f"[API] [{account_manager.config.account_id}] [req_{request_id}] 附带文件: {len(file_ids)}个")
 
     jwt = await account_manager.get_jwt(request_id)
-    headers = get_common_headers(jwt)
+    headers = get_common_headers(jwt, USER_AGENT)
 
     body = {
         "configId": account_manager.config.config_id,
@@ -2682,43 +1354,39 @@ async def stream_chat_generator(session: str, text_content: str, file_ids: List[
 
             # 处理图片生成
             if json_objects:
-                logger.info(f"[IMAGE] [{account_manager.config.account_id}] [req_{request_id}] 开始解析图片，共{len(json_objects)}个响应对象")
                 file_ids, session_name = parse_images_from_response(json_objects)
-                logger.info(f"[IMAGE] [{account_manager.config.account_id}] [req_{request_id}] 解析结果: {len(file_ids)}张图片")
-                logger.info(f"[IMAGE] [DEBUG] 响应中的session路径: {session_name}")
 
                 if file_ids and session_name:
                     logger.info(f"[IMAGE] [{account_manager.config.account_id}] [req_{request_id}] 检测到{len(file_ids)}张生成图片")
 
                     try:
-                        # 获取base_url
                         base_url = get_base_url(request) if request else ""
-                        logger.info(f"[IMAGE] [DEBUG] 使用base_url: {base_url}")
+                        file_metadata = await get_session_file_metadata(account_manager, session_name, http_client, USER_AGENT, request_id)
 
-                        # 获取文件元数据，找到正确的session路径
-                        file_metadata = await get_session_file_metadata(account_manager, session_name, request_id)
-                        logger.info(f"[IMAGE] [DEBUG] 获取到{len(file_metadata)}个文件元数据")
+                        # 并行下载所有图片
+                        download_tasks = []
+                        for file_info in file_ids:
+                            fid = file_info["fileId"]
+                            mime = file_info["mimeType"]
+                            meta = file_metadata.get(fid, {})
+                            correct_session = meta.get("session") or session_name
+                            task = download_image_with_jwt(account_manager, correct_session, fid, http_client, USER_AGENT, request_id)
+                            download_tasks.append((fid, mime, task))
 
-                        for idx, file_info in enumerate(file_ids, 1):
-                            try:
-                                fid = file_info["fileId"]
-                                mime = file_info["mimeType"]
+                        results = await asyncio.gather(*[task for _, _, task in download_tasks], return_exceptions=True)
 
-                                # 从元数据中获取正确的session路径
-                                meta = file_metadata.get(fid, {})
-                                correct_session = meta.get("session") or session_name
-                                logger.info(f"[IMAGE] [DEBUG] 文件{fid}使用session: {correct_session}")
+                        # 处理下载结果
+                        for idx, ((fid, mime, _), result) in enumerate(zip(download_tasks, results), 1):
+                            if isinstance(result, Exception):
+                                logger.error(f"[IMAGE] [{account_manager.config.account_id}] [req_{request_id}] 图片{idx}下载失败: {type(result).__name__}")
+                                continue
 
-                                image_data = await download_image_with_jwt(account_manager, correct_session, fid, request_id)
-                                image_url = save_image_to_hf(image_data, chat_id, fid, mime, base_url)
-                                logger.info(f"[IMAGE] [{account_manager.config.account_id}] [req_{request_id}] 图片已保存: {image_url}")
+                            image_url = save_image_to_hf(result, chat_id, fid, mime, base_url, IMAGE_DIR)
+                            logger.info(f"[IMAGE] [{account_manager.config.account_id}] [req_{request_id}] 图片{idx}已保存: {image_url}")
 
-                                # 返回Markdown格式图片
-                                markdown = f"\n\n![生成的图片]({image_url})\n\n"
-                                chunk = create_chunk(chat_id, created_time, model_name, {"content": markdown}, None)
-                                yield f"data: {chunk}\n\n"
-                            except Exception as e:
-                                logger.error(f"[IMAGE] [{account_manager.config.account_id}] [req_{request_id}] 单张图片处理失败: {str(e)}")
+                            markdown = f"\n\n![生成的图片]({image_url})\n\n"
+                            chunk = create_chunk(chat_id, created_time, model_name, {"content": markdown}, None)
+                            yield f"data: {chunk}\n\n"
 
                     except Exception as e:
                         logger.error(f"[IMAGE] [{account_manager.config.account_id}] [req_{request_id}] 图片处理失败: {str(e)}")
@@ -2739,10 +1407,22 @@ async def stream_chat_generator(session: str, text_content: str, file_ids: List[
         yield "data: [DONE]\n\n"
 
 # ---------- 公开端点（无需认证） ----------
+@app.get("/public/uptime")
+async def get_public_uptime(days: int = 90):
+    """获取 Uptime 监控数据（JSON格式）"""
+    if days < 1 or days > 90:
+        days = 90
+    return await uptime_tracker.get_uptime_summary(days)
+
+@app.get("/public/uptime/html")
+async def get_public_uptime_html():
+    """Uptime 监控页面（类似 status.openai.com）"""
+    return await templates.get_uptime_html()
+
 @app.get("/public/stats")
 async def get_public_stats():
     """获取公开统计信息"""
-    with stats_lock:
+    async with stats_lock:
         # 清理1小时前的请求时间戳
         current_time = time.time()
         global_stats["request_timestamps"] = [
@@ -2779,503 +1459,54 @@ async def get_public_stats():
 @app.get("/public/log")
 async def get_public_logs(request: Request, limit: int = 100):
     """获取脱敏后的日志（JSON格式）"""
-    # 基于IP的访问统计（24小时内去重）
-    # 优先从 X-Forwarded-For 获取真实IP（处理代理情况）
-    client_ip = request.headers.get("x-forwarded-for")
-    if client_ip:
-        # X-Forwarded-For 可能包含多个IP，取第一个
-        client_ip = client_ip.split(",")[0].strip()
-    else:
-        # 没有代理时使用直连IP
-        client_ip = request.client.host if request.client else "unknown"
+    try:
+        # 基于IP的访问统计（24小时内去重）
+        # 优先从 X-Forwarded-For 获取真实IP（处理代理情况）
+        client_ip = request.headers.get("x-forwarded-for")
+        if client_ip:
+            # X-Forwarded-For 可能包含多个IP，取第一个
+            client_ip = client_ip.split(",")[0].strip()
+        else:
+            # 没有代理时使用直连IP
+            client_ip = request.client.host if request.client else "unknown"
 
-    current_time = time.time()
+        current_time = time.time()
 
-    with stats_lock:
-        # 清理24小时前的IP记录
-        if "visitor_ips" not in global_stats:
-            global_stats["visitor_ips"] = {}
+        async with stats_lock:
+            # 清理24小时前的IP记录
+            if "visitor_ips" not in global_stats:
+                global_stats["visitor_ips"] = {}
 
-        expired_ips = [
-            ip for ip, timestamp in global_stats["visitor_ips"].items()
-            if current_time - timestamp > 86400  # 24小时
-        ]
-        for ip in expired_ips:
-            del global_stats["visitor_ips"][ip]
+            expired_ips = [
+                ip for ip, timestamp in global_stats["visitor_ips"].items()
+                if current_time - timestamp > 86400  # 24小时
+            ]
+            for ip in expired_ips:
+                del global_stats["visitor_ips"][ip]
 
-        # 记录新访问（24小时内同一IP只计数一次）
-        if client_ip not in global_stats["visitor_ips"]:
-            global_stats["visitor_ips"][client_ip] = current_time
+            # 记录新访问（24小时内同一IP只计数一次）
+            if client_ip not in global_stats["visitor_ips"]:
+                global_stats["visitor_ips"][client_ip] = current_time
+
+            # 同步访问者计数（清理后的实际数量）
             global_stats["total_visitors"] = len(global_stats["visitor_ips"])
-            save_stats(global_stats)
+            await save_stats(global_stats)
 
-    sanitized_logs = get_sanitized_logs(limit=min(limit, 1000))
-    return {
-        "total": len(sanitized_logs),
-        "logs": sanitized_logs
-    }
+        sanitized_logs = get_sanitized_logs(limit=min(limit, 1000))
+        return {
+            "total": len(sanitized_logs),
+            "logs": sanitized_logs
+        }
+    except Exception as e:
+        logger.error(f"[LOG] 获取公开日志失败: {e}")
+        return {"total": 0, "logs": [], "error": str(e)}
 
 @app.get("/public/log/html")
 async def get_public_logs_html():
     """公开的脱敏日志查看器"""
-    html_content = """
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <meta charset="utf-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <title>服务状态</title>
-        <style>
-            * { margin: 0; padding: 0; box-sizing: border-box; }
-            html, body { height: 100%; overflow: hidden; }
-            body {
-                font-family: 'Consolas', 'Monaco', monospace;
-                background: #fafaf9;
-                display: flex;
-                align-items: center;
-                justify-content: center;
-                padding: 15px;
-            }
-            .container {
-                width: 100%;
-                max-width: 1200px;
-                height: calc(100vh - 30px);
-                background: white;
-                border-radius: 16px;
-                padding: 30px;
-                box-shadow: 0 2px 8px rgba(0,0,0,0.08);
-                display: flex;
-                flex-direction: column;
-            }
-            h1 {
-                color: #1a1a1a;
-                font-size: 22px;
-                font-weight: 600;
-                margin-bottom: 20px;
-                display: flex;
-                align-items: center;
-                justify-content: center;
-                gap: 12px;
-            }
-            h1 img {
-                width: 32px;
-                height: 32px;
-                border-radius: 8px;
-            }
-            .info-bar {
-                background: #f9f9f9;
-                border: 1px solid #e5e5e5;
-                border-radius: 8px;
-                padding: 12px 16px;
-                margin-bottom: 16px;
-                display: flex;
-                align-items: center;
-                justify-content: space-between;
-                flex-wrap: wrap;
-                gap: 12px;
-            }
-            .info-item {
-                display: flex;
-                align-items: center;
-                gap: 6px;
-                font-size: 13px;
-                color: #6b6b6b;
-            }
-            .info-item strong { color: #1a1a1a; }
-            .info-item a {
-                color: #1a73e8;
-                text-decoration: none;
-                font-weight: 500;
-            }
-            .info-item a:hover { text-decoration: underline; }
-            .stats {
-                display: grid;
-                grid-template-columns: repeat(4, 1fr);
-                gap: 12px;
-                margin-bottom: 16px;
-            }
-            .stat {
-                background: #fafaf9;
-                padding: 12px;
-                border: 1px solid #e5e5e5;
-                border-radius: 8px;
-                text-align: center;
-                transition: all 0.15s ease;
-            }
-            .stat:hover { border-color: #d4d4d4; }
-            .stat-label { color: #6b6b6b; font-size: 11px; margin-bottom: 4px; }
-            .stat-value { color: #1a1a1a; font-size: 18px; font-weight: 600; }
-            .log-container {
-                flex: 1;
-                background: #fafaf9;
-                border: 1px solid #e5e5e5;
-                border-radius: 8px;
-                padding: 12px;
-                overflow-y: auto;
-                scrollbar-width: thin;
-                scrollbar-color: rgba(0,0,0,0.15) transparent;
-            }
-            .log-container::-webkit-scrollbar { width: 4px; }
-            .log-container::-webkit-scrollbar-track { background: transparent; }
-            .log-container::-webkit-scrollbar-thumb {
-                background: rgba(0,0,0,0.15);
-                border-radius: 2px;
-            }
-            .log-container::-webkit-scrollbar-thumb:hover { background: rgba(0,0,0,0.3); }
-            .log-group {
-                margin-bottom: 8px;
-                border: 1px solid #e5e5e5;
-                border-radius: 8px;
-                background: white;
-            }
-            .log-group-header {
-                padding: 10px 12px;
-                background: #f9f9f9;
-                border-radius: 8px 8px 0 0;
-                cursor: pointer;
-                display: flex;
-                align-items: center;
-                gap: 8px;
-                transition: background 0.15s ease;
-            }
-            .log-group-header:hover { background: #f0f0f0; }
-            .log-group-content { padding: 8px; }
-            .log-entry {
-                padding: 8px 10px;
-                margin-bottom: 4px;
-                background: white;
-                border: 1px solid #e5e5e5;
-                border-radius: 6px;
-                display: flex;
-                align-items: center;
-                gap: 10px;
-                font-size: 13px;
-                transition: all 0.15s ease;
-            }
-            .log-entry:hover { border-color: #d4d4d4; }
-            .log-time { color: #6b6b6b; font-size: 12px; min-width: 140px; }
-            .log-status {
-                padding: 2px 8px;
-                border-radius: 4px;
-                font-size: 11px;
-                font-weight: 600;
-                min-width: 60px;
-                text-align: center;
-            }
-            .status-success { background: #d1fae5; color: #065f46; }
-            .status-error { background: #fee2e2; color: #991b1b; }
-            .status-in_progress { background: #fef3c7; color: #92400e; }
-            .status-timeout { background: #fef3c7; color: #92400e; }
-            .log-info { flex: 1; color: #374151; }
-            .toggle-icon {
-                display: inline-block;
-                transition: transform 0.2s ease;
-            }
-            .toggle-icon.collapsed { transform: rotate(-90deg); }
-            .subtitle-public {
-                display: flex;
-                justify-content: center;
-                align-items: center;
-                gap: 8px;
-                flex-wrap: wrap;
-            }
-
-            @media (max-width: 768px) {
-                body { padding: 0; }
-                .container {
-                    padding: 15px;
-                    height: 100vh;
-                    border-radius: 0;
-                    max-width: 100%;
-                }
-                h1 { font-size: 18px; margin-bottom: 12px; }
-                .subtitle-public {
-                    flex-direction: column;
-                    gap: 6px;
-                }
-                .subtitle-public span {
-                    font-size: 11px;
-                    line-height: 1.6;
-                }
-                .subtitle-public a {
-                    font-size: 12px;
-                    font-weight: 600;
-                }
-                .info-bar {
-                    padding: 10px 12px;
-                    flex-direction: column;
-                    align-items: flex-start;
-                    gap: 8px;
-                }
-                .info-item { font-size: 12px; }
-                .stats {
-                    grid-template-columns: repeat(2, 1fr);
-                    gap: 8px;
-                    margin-bottom: 12px;
-                }
-                .stat { padding: 8px; }
-                .stat-label { font-size: 10px; }
-                .stat-value { font-size: 16px; }
-                .log-container { padding: 8px; }
-                .log-group { margin-bottom: 6px; }
-                .log-group-header {
-                    padding: 8px 10px;
-                    font-size: 11px;
-                    flex-wrap: wrap;
-                }
-                .log-group-header span { font-size: 10px !important; }
-                .log-entry {
-                    padding: 6px 8px;
-                    font-size: 11px;
-                    flex-direction: column;
-                    align-items: flex-start;
-                    gap: 4px;
-                }
-                .log-time {
-                    min-width: auto;
-                    font-size: 10px;
-                }
-                .log-info {
-                    font-size: 11px;
-                    word-break: break-word;
-                }
-            }
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <h1>
-                """ + (f'<img src="{LOGO_URL}" alt="Logo">' if LOGO_URL else '') + """
-                Gemini服务状态
-            </h1>
-            <div style="text-align: center; color: #999; font-size: 12px; margin-bottom: 16px;" class="subtitle-public">
-                <span>展示最近1000条对话日志 · 每5秒自动更新</span>
-                """ + (f'<a href="{CHAT_URL}" target="_blank" style="color: #1a73e8; text-decoration: none;">开始对话</a>' if CHAT_URL else '<span style="color: #999;">开始对话</span>') + """
-            </div>
-            <div class="stats">
-                <div class="stat">
-                    <div class="stat-label">总访问</div>
-                    <div class="stat-value" id="stat-visitors">0</div>
-                </div>
-                <div class="stat">
-                    <div class="stat-label">每分钟请求</div>
-                    <div class="stat-value" id="stat-load">0</div>
-                </div>
-                <div class="stat">
-                    <div class="stat-label">平均响应</div>
-                    <div class="stat-value" id="stat-avg-time">-</div>
-                </div>
-                <div class="stat">
-                    <div class="stat-label">成功率</div>
-                    <div class="stat-value" id="stat-success-rate" style="color: #10b981;">-</div>
-                </div>
-                <div class="stat">
-                    <div class="stat-label">对话次数</div>
-                    <div class="stat-value" id="stat-total">0</div>
-                </div>
-                <div class="stat">
-                    <div class="stat-label">成功</div>
-                    <div class="stat-value" id="stat-success" style="color: #10b981;">0</div>
-                </div>
-                <div class="stat">
-                    <div class="stat-label">失败</div>
-                    <div class="stat-value" id="stat-error" style="color: #ef4444;">0</div>
-                </div>
-                <div class="stat">
-                    <div class="stat-label">更新时间</div>
-                    <div class="stat-value" id="stat-update-time" style="font-size: 14px; color: #6b6b6b;">--:--</div>
-                </div>
-            </div>
-            <div class="log-container" id="log-container">
-                <div style="text-align: center; color: #999; padding: 20px;">加载中...</div>
-            </div>
-        </div>
-        <script>
-            async function loadData() {
-                try {
-                    // 并行加载日志和统计数据
-                    const [logsResponse, statsResponse] = await Promise.all([
-                        fetch('/public/log?limit=1000'),
-                        fetch('/public/stats')
-                    ]);
-
-                    const logsData = await logsResponse.json();
-                    const statsData = await statsResponse.json();
-
-                    displayLogs(logsData.logs);
-                    updateStats(logsData.logs, statsData);
-                } catch (error) {
-                    document.getElementById('log-container').innerHTML = '<div style="text-align: center; color: #f44336; padding: 20px;">加载失败: ' + error.message + '</div>';
-                }
-            }
-
-            function displayLogs(logs) {
-                const container = document.getElementById('log-container');
-                if (logs.length === 0) {
-                    container.innerHTML = '<div style="text-align: center; color: #999; padding: 20px;">暂无日志</div>';
-                    return;
-                }
-
-                // 读取折叠状态
-                const foldState = JSON.parse(localStorage.getItem('public-log-fold-state') || '{}');
-
-                let html = '';
-                logs.forEach(log => {
-                    const reqId = log.request_id;
-
-                    // 状态图标和颜色
-                    let statusColor = '#ff9800';
-                    let statusText = '进行中';
-
-                    if (log.status === 'success') {
-                        statusColor = '#4caf50';
-                        statusText = '成功';
-                    } else if (log.status === 'error') {
-                        statusColor = '#f44336';
-                        statusText = '失败';
-                    } else if (log.status === 'timeout') {
-                        statusColor = '#ffc107';
-                        statusText = '超时';
-                    }
-
-                    // 检查折叠状态
-                    const isCollapsed = foldState[reqId] === true;
-                    const contentStyle = isCollapsed ? 'style="display: none;"' : '';
-                    const iconClass = isCollapsed ? 'class="toggle-icon collapsed"' : 'class="toggle-icon"';
-
-                    // 构建事件列表
-                    let eventsHtml = '';
-                    log.events.forEach(event => {
-                        let eventClass = 'log-entry';
-                        let eventLabel = '';
-
-                        if (event.type === 'start') {
-                            eventLabel = '<span style="color: #2563eb; font-weight: 600;">开始对话</span>';
-                        } else if (event.type === 'select') {
-                            eventLabel = '<span style="color: #8b5cf6; font-weight: 600;">选择</span>';
-                        } else if (event.type === 'retry') {
-                            eventLabel = '<span style="color: #f59e0b; font-weight: 600;">重试</span>';
-                        } else if (event.type === 'switch') {
-                            eventLabel = '<span style="color: #06b6d4; font-weight: 600;">切换</span>';
-                        } else if (event.type === 'complete') {
-                            if (event.status === 'success') {
-                                eventLabel = '<span style="color: #10b981; font-weight: 600;">完成</span>';
-                            } else if (event.status === 'error') {
-                                eventLabel = '<span style="color: #ef4444; font-weight: 600;">失败</span>';
-                            } else if (event.status === 'timeout') {
-                                eventLabel = '<span style="color: #f59e0b; font-weight: 600;">超时</span>';
-                            }
-                        }
-
-                        eventsHtml += `
-                            <div class="${eventClass}">
-                                <div class="log-time">${event.time}</div>
-                                <div style="min-width: 60px;">${eventLabel}</div>
-                                <div class="log-info">${event.content}</div>
-                            </div>
-                        `;
-                    });
-
-                    html += `
-                        <div class="log-group" data-req-id="${reqId}">
-                            <div class="log-group-header" onclick="toggleGroup('${reqId}')">
-                                <span style="color: ${statusColor}; font-weight: 600; font-size: 11px;">⬤ ${statusText}</span>
-                                <span style="color: #999; font-size: 11px;">${log.events.length}条事件</span>
-                                <span ${iconClass} style="margin-left: auto; color: #999;">▼</span>
-                            </div>
-                            <div class="log-group-content" ${contentStyle}>
-                                ${eventsHtml}
-                            </div>
-                        </div>
-                    `;
-                });
-
-                container.innerHTML = html;
-            }
-
-            function updateStats(logs, statsData) {
-                const total = logs.length;
-                const successLogs = logs.filter(log => log.status === 'success');
-                const success = successLogs.length;
-                const error = logs.filter(log => log.status === 'error').length;
-
-                // 计算平均响应时间
-                let avgTime = '-';
-                if (success > 0) {
-                    let totalDuration = 0;
-                    let count = 0;
-                    successLogs.forEach(log => {
-                        log.events.forEach(event => {
-                            if (event.type === 'complete' && event.content.includes('耗时')) {
-                                const match = event.content.match(/([\d.]+)s/);
-                                if (match) {
-                                    totalDuration += parseFloat(match[1]);
-                                    count++;
-                                }
-                            }
-                        });
-                    });
-                    if (count > 0) {
-                        avgTime = (totalDuration / count).toFixed(1) + 's';
-                    }
-                }
-
-                // 计算成功率
-                const totalCompleted = success + error;
-                const successRate = totalCompleted > 0 ? ((success / totalCompleted) * 100).toFixed(1) + '%' : '-';
-
-                // 更新日志统计
-                document.getElementById('stat-total').textContent = total;
-                document.getElementById('stat-success').textContent = success;
-                document.getElementById('stat-error').textContent = error;
-                document.getElementById('stat-success-rate').textContent = successRate;
-                document.getElementById('stat-avg-time').textContent = avgTime;
-
-                // 更新全局统计
-                document.getElementById('stat-visitors').textContent = statsData.total_visitors;
-
-                // 更新负载状态（带颜色）
-                const loadElement = document.getElementById('stat-load');
-                loadElement.textContent = statsData.requests_per_minute;
-                loadElement.style.color = statsData.load_color;
-
-                // 更新时间
-                document.getElementById('stat-update-time').textContent = new Date().toLocaleTimeString('zh-CN', {hour: '2-digit', minute: '2-digit', second: '2-digit'});
-            }
-
-            function toggleGroup(reqId) {
-                const group = document.querySelector(`.log-group[data-req-id="${reqId}"]`);
-                const content = group.querySelector('.log-group-content');
-                const icon = group.querySelector('.toggle-icon');
-
-                const isCollapsed = content.style.display === 'none';
-                if (isCollapsed) {
-                    content.style.display = 'block';
-                    icon.classList.remove('collapsed');
-                } else {
-                    content.style.display = 'none';
-                    icon.classList.add('collapsed');
-                }
-
-                // 保存折叠状态
-                const foldState = JSON.parse(localStorage.getItem('public-log-fold-state') || '{}');
-                foldState[reqId] = !isCollapsed;
-                localStorage.setItem('public-log-fold-state', JSON.stringify(foldState));
-            }
-
-            // 初始加载
-            loadData();
-
-            // 自动刷新（每5秒）
-            setInterval(loadData, 5000);
-        </script>
-    </body>
-    </html>
-    """
-    return HTMLResponse(content=html_content)
+    return await templates.get_public_logs_html()
 
 # ---------- 全局 404 处理（必须在最后） ----------
-from fastapi.responses import JSONResponse
 
 @app.exception_handler(404)
 async def not_found_handler(request: Request, exc: HTTPException):
@@ -3284,12 +1515,6 @@ async def not_found_handler(request: Request, exc: HTTPException):
         status_code=404,
         content={"detail": "Not Found"}
     )
-
-# 捕获所有未匹配的路径（必须在所有路由之后）
-@app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"])
-async def catch_all(path: str):
-    """捕获所有未匹配的路径，返回 404"""
-    raise HTTPException(404, "Not Found")
 
 if __name__ == "__main__":
     import uvicorn
