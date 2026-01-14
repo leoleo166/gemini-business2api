@@ -18,8 +18,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# 配置文件路径
-ACCOUNTS_FILE = "accounts.json"
+# 配置文件路径 - 自动检测环境
+if os.path.exists("/data"):
+    ACCOUNTS_FILE = "/data/accounts.json"  # HF Pro 持久化
+else:
+    ACCOUNTS_FILE = "data/accounts.json"  # 本地存储（统一到 data 目录）
 
 
 @dataclass
@@ -254,6 +257,13 @@ class MultiAccountManager:
                 self._session_locks[conv_key] = asyncio.Lock()
             return self._session_locks[conv_key]
 
+    def update_http_client(self, http_client):
+        """更新所有账户使用的 http_client（用于代理变更后重建客户端）"""
+        for account_mgr in self.accounts.values():
+            account_mgr.http_client = http_client
+            if account_mgr.jwt_manager is not None:
+                account_mgr.jwt_manager.http_client = http_client
+
     def add_account(self, config: AccountConfig, http_client, user_agent: str, account_failure_threshold: int, rate_limit_cooldown_seconds: int, global_stats: dict):
         """添加账户"""
         manager = AccountManager(config, http_client, user_agent, account_failure_threshold, rate_limit_cooldown_seconds)
@@ -311,37 +321,38 @@ def save_accounts_to_file(accounts_data: list):
 
 
 def load_accounts_from_source() -> list:
-    """优先从文件加载，否则从环境变量加载"""
-    # 优先从文件加载
+    """从环境变量或文件加载账户配置，优先使用环境变量"""
+    # 优先从环境变量加载
+    env_accounts = os.environ.get('ACCOUNTS_CONFIG')
+    if env_accounts:
+        try:
+            accounts_data = json.loads(env_accounts)
+            if accounts_data:
+                logger.info(f"[CONFIG] 从环境变量加载配置，共 {len(accounts_data)} 个账户")
+            else:
+                logger.warning(f"[CONFIG] 环境变量 ACCOUNTS_CONFIG 为空")
+            return accounts_data
+        except Exception as e:
+            logger.error(f"[CONFIG] 环境变量加载失败: {str(e)}，尝试从文件加载")
+
+    # 从文件加载
     if os.path.exists(ACCOUNTS_FILE):
         try:
             with open(ACCOUNTS_FILE, 'r', encoding='utf-8') as f:
                 accounts_data = json.load(f)
-            logger.info(f"[CONFIG] 从文件加载配置: {ACCOUNTS_FILE}")
+            if accounts_data:
+                logger.info(f"[CONFIG] 从文件加载配置: {ACCOUNTS_FILE}，共 {len(accounts_data)} 个账户")
+            else:
+                logger.warning(f"[CONFIG] 账户配置为空，请在管理面板添加账户或编辑 {ACCOUNTS_FILE}")
             return accounts_data
         except Exception as e:
-            logger.warning(f"[CONFIG] 文件加载失败，尝试环境变量: {str(e)}")
+            logger.warning(f"[CONFIG] 文件加载失败: {str(e)}，创建空配置")
 
-    # 从环境变量加载
-    accounts_json = os.getenv("ACCOUNTS_CONFIG")
-    if not accounts_json:
-        raise ValueError(
-            "未找到配置文件或 ACCOUNTS_CONFIG 环境变量。\n"
-            "请在环境变量中配置 JSON 格式的账户列表，格式示例：\n"
-            '[{"id":"account_1","csesidx":"xxx","config_id":"yyy","secure_c_ses":"zzz","host_c_oses":null,"expires_at":"2025-12-23 10:59:21"}]'
-        )
-
-    try:
-        accounts_data = json.loads(accounts_json)
-        if not isinstance(accounts_data, list):
-            raise ValueError("ACCOUNTS_CONFIG 必须是 JSON 数组格式")
-        # 首次从环境变量加载后，保存到文件
-        save_accounts_to_file(accounts_data)
-        logger.info(f"[CONFIG] 从环境变量加载配置并保存到文件")
-        return accounts_data
-    except json.JSONDecodeError as e:
-        logger.error(f"[CONFIG] ACCOUNTS_CONFIG JSON 解析失败: {str(e)}")
-        raise ValueError(f"ACCOUNTS_CONFIG 格式错误: {str(e)}")
+    # 文件不存在，创建空配置
+    logger.warning(f"[CONFIG] 未找到 {ACCOUNTS_FILE}，已创建空配置文件")
+    logger.info(f"[CONFIG] 💡 请在管理面板添加账户，或直接编辑 {ACCOUNTS_FILE}，或使用批量上传功能，或设置环境变量 ACCOUNTS_CONFIG")
+    save_accounts_to_file([])
+    return []
 
 
 def get_account_id(acc: dict, index: int) -> str:
@@ -387,9 +398,9 @@ def load_multi_account_config(
         manager.add_account(config, http_client, user_agent, account_failure_threshold, rate_limit_cooldown_seconds, global_stats)
 
     if not manager.accounts:
-        raise ValueError("没有有效的账户配置（可能全部已过期）")
-
-    logger.info(f"[CONFIG] 成功加载 {len(manager.accounts)} 个账户")
+        logger.warning(f"[CONFIG] 没有有效的账户配置，服务将启动但无法处理请求，请在管理面板添加账户")
+    else:
+        logger.info(f"[CONFIG] 成功加载 {len(manager.accounts)} 个账户")
     return manager
 
 
@@ -402,7 +413,19 @@ def reload_accounts(
     session_cache_ttl_seconds: int,
     global_stats: dict
 ) -> MultiAccountManager:
-    """重新加载账户配置（清空缓存并重新加载）"""
+    """重新加载账户配置（保留现有账户的运行时状态）"""
+    # 保存现有账户的运行时状态
+    old_states = {}
+    for account_id, account_mgr in multi_account_mgr.accounts.items():
+        old_states[account_id] = {
+            "is_available": account_mgr.is_available,
+            "last_error_time": account_mgr.last_error_time,
+            "last_429_time": account_mgr.last_429_time,
+            "error_count": account_mgr.error_count,
+            "conversation_count": account_mgr.conversation_count
+        }
+
+    # 清空会话缓存并重新加载配置
     multi_account_mgr.global_session_cache.clear()
     new_mgr = load_multi_account_config(
         http_client,
@@ -412,6 +435,18 @@ def reload_accounts(
         session_cache_ttl_seconds,
         global_stats
     )
+
+    # 恢复现有账户的运行时状态
+    for account_id, state in old_states.items():
+        if account_id in new_mgr.accounts:
+            account_mgr = new_mgr.accounts[account_id]
+            account_mgr.is_available = state["is_available"]
+            account_mgr.last_error_time = state["last_error_time"]
+            account_mgr.last_429_time = state["last_429_time"]
+            account_mgr.error_count = state["error_count"]
+            account_mgr.conversation_count = state["conversation_count"]
+            logger.debug(f"[CONFIG] 账户 {account_id} 运行时状态已恢复")
+
     logger.info(f"[CONFIG] 配置已重载，当前账户数: {len(new_mgr.accounts)}")
     return new_mgr
 

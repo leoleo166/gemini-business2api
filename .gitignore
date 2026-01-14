@@ -36,12 +36,13 @@ ENV/
 .env
 *.log
 data/stats.json
+data/settings.yaml
 accounts.json
 
 # Generated files
 data/images/
-static/
 logs/
+test/
 
 # OS
 .DS_Store
