@@ -13,6 +13,9 @@ from typing import Dict, List, Optional, TYPE_CHECKING
 
 from fastapi import HTTPException
 
+# 导入存储层（支持数据库）
+from core import storage
+
 if TYPE_CHECKING:
     from core.jwt import JWTManager
 
@@ -35,6 +38,12 @@ class AccountConfig:
     config_id: str
     expires_at: Optional[str] = None  # 账户过期时间 (格式: "2025-12-23 10:59:21")
     disabled: bool = False  # 手动禁用状态
+    mail_provider: Optional[str] = None
+    mail_address: Optional[str] = None
+    mail_password: Optional[str] = None
+    mail_client_id: Optional[str] = None
+    mail_refresh_token: Optional[str] = None
+    mail_tenant: Optional[str] = None
 
     def get_remaining_hours(self) -> Optional[float]:
         """计算账户剩余小时数"""
@@ -129,16 +138,21 @@ class AccountManager:
             raise
 
     def should_retry(self) -> bool:
-        """检查账户是否可重试（429错误10分钟后恢复，普通错误永久禁用）"""
+        """检查账户是否可重试（429错误冷却期后自动恢复，普通错误永久禁用）"""
         if self.is_available:
             return True
 
         current_time = time.time()
 
-        # 检查429冷却期（10分钟后自动恢复）
+        # 检查429冷却期（冷却期后自动恢复）
         if self.last_429_time > 0:
             if current_time - self.last_429_time > self.rate_limit_cooldown_seconds:
-                return True  # 冷却期已过，可以重试
+                # 冷却期已过，自动恢复账户可用性
+                self.is_available = True
+                self.last_429_time = 0.0
+                self.error_count = 0  # 重置错误计数
+                logger.info(f"[ACCOUNT] [{self.config.account_id}] 429冷却期已过，账户已自动恢复")
+                return True
             return False  # 仍在冷却期
 
         # 普通错误永久禁用
@@ -275,7 +289,7 @@ class MultiAccountManager:
         logger.info(f"[MULTI] [ACCOUNT] 添加账户: {config.account_id}")
 
     async def get_account(self, account_id: Optional[str] = None, request_id: str = "") -> AccountManager:
-        """获取账户 (轮询或指定) - 优化锁粒度，减少竞争"""
+        """获取账户 (智能选择或指定) - 优先选择健康账户，提升响应速度"""
         req_tag = f"[req_{request_id}] " if request_id else ""
 
         # 如果指定了账户ID（无需锁）
@@ -287,42 +301,78 @@ class MultiAccountManager:
                 raise HTTPException(503, f"Account {account_id} temporarily unavailable")
             return account
 
-        # 轮询选择可用账户（无锁读取账户列表）
-        available_accounts = [
-            acc_id for acc_id in self.account_list
-            if self.accounts[acc_id].should_retry()
-            and not self.accounts[acc_id].config.is_expired()
-            and not self.accounts[acc_id].config.disabled
-        ]
+        # 智能选择可用账户（优先健康账户，提升响应速度）
+        available_accounts = []
+        for acc_id in self.account_list:
+            account = self.accounts[acc_id]
+            # 检查账户是否可用（会自动恢复429冷却期后的账户）
+            if (account.should_retry() and
+                not account.config.is_expired() and
+                not account.config.disabled):
+                # 计算账户健康度（error_count越低越健康）
+                health_score = -account.error_count  # 负数，越大越健康
+                available_accounts.append((acc_id, health_score))
 
         if not available_accounts:
             raise HTTPException(503, "No available accounts")
+
+        # 按健康度排序（优先选择error_count最低的账户）
+        available_accounts.sort(key=lambda x: x[1], reverse=True)
 
         # 只在更新索引时加锁（最小化锁持有时间）
         async with self._index_lock:
             if not hasattr(self, '_available_index'):
                 self._available_index = 0
 
-            account_id = available_accounts[self._available_index % len(available_accounts)]
-            self._available_index = (self._available_index + 1) % len(available_accounts)
+            # 在健康账户中轮询（只在前50%健康账户中选择）
+            healthy_count = max(1, len(available_accounts) // 2)
+            healthy_accounts = [acc_id for acc_id, _ in available_accounts[:healthy_count]]
+
+            account_id = healthy_accounts[self._available_index % len(healthy_accounts)]
+            self._available_index = (self._available_index + 1) % len(healthy_accounts)
 
         account = self.accounts[account_id]
-        logger.info(f"[MULTI] [ACCOUNT] {req_tag}选择账户: {account_id}")
+        logger.info(f"[MULTI] [ACCOUNT] {req_tag}选择账户: {account_id} (健康度: {account.error_count}错误)")
         return account
 
 
 # ---------- 配置文件管理 ----------
 
-def save_accounts_to_file(accounts_data: list):
-    """保存账户配置到文件"""
+def _save_to_file(accounts_data: list):
+    """保存账户配置到本地文件"""
+    os.makedirs(os.path.dirname(ACCOUNTS_FILE) or ".", exist_ok=True)
     with open(ACCOUNTS_FILE, 'w', encoding='utf-8') as f:
         json.dump(accounts_data, f, ensure_ascii=False, indent=2)
     logger.info(f"[CONFIG] 配置已保存到 {ACCOUNTS_FILE}")
 
 
+def _load_from_file() -> list:
+    """从本地文件加载账户配置"""
+    if os.path.exists(ACCOUNTS_FILE):
+        try:
+            with open(ACCOUNTS_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception as e:
+            logger.warning(f"[CONFIG] 文件加载失败: {str(e)}")
+    return None
+
+
+def save_accounts_to_file(accounts_data: list):
+    """保存账户配置（优先数据库，降级到文件）"""
+    if storage.is_database_enabled():
+        try:
+            saved = storage.save_accounts_sync(accounts_data)
+            if saved:
+                return
+        except Exception as e:
+            logger.warning(f"[CONFIG] 数据库保存失败: {e}，降级到文件存储")
+
+    _save_to_file(accounts_data)
+
+
 def load_accounts_from_source() -> list:
-    """从环境变量或文件加载账户配置，优先使用环境变量"""
-    # 优先从环境变量加载
+    """从环境变量、数据库或文件加载账户配置"""
+    # 1. 优先从环境变量加载
     env_accounts = os.environ.get('ACCOUNTS_CONFIG')
     if env_accounts:
         try:
@@ -333,24 +383,33 @@ def load_accounts_from_source() -> list:
                 logger.warning(f"[CONFIG] 环境变量 ACCOUNTS_CONFIG 为空")
             return accounts_data
         except Exception as e:
-            logger.error(f"[CONFIG] 环境变量加载失败: {str(e)}，尝试从文件加载")
+            logger.error(f"[CONFIG] 环境变量加载失败: {str(e)}")
 
-    # 从文件加载
-    if os.path.exists(ACCOUNTS_FILE):
+    # 2. 尝试从数据库加载
+    if storage.is_database_enabled():
         try:
-            with open(ACCOUNTS_FILE, 'r', encoding='utf-8') as f:
-                accounts_data = json.load(f)
-            if accounts_data:
-                logger.info(f"[CONFIG] 从文件加载配置: {ACCOUNTS_FILE}，共 {len(accounts_data)} 个账户")
-            else:
-                logger.warning(f"[CONFIG] 账户配置为空，请在管理面板添加账户或编辑 {ACCOUNTS_FILE}")
-            return accounts_data
+            accounts_data = storage.load_accounts_sync()
+            if accounts_data is not None:
+                if accounts_data:
+                    logger.info(f"[CONFIG] 从数据库加载配置，共 {len(accounts_data)} 个账户")
+                else:
+                    logger.warning(f"[CONFIG] 数据库中账户配置为空")
+                return accounts_data
         except Exception as e:
-            logger.warning(f"[CONFIG] 文件加载失败: {str(e)}，创建空配置")
+            logger.warning(f"[CONFIG] 数据库加载失败: {e}，降级到文件存储")
 
-    # 文件不存在，创建空配置
-    logger.warning(f"[CONFIG] 未找到 {ACCOUNTS_FILE}，已创建空配置文件")
-    logger.info(f"[CONFIG] 💡 请在管理面板添加账户，或直接编辑 {ACCOUNTS_FILE}，或使用批量上传功能，或设置环境变量 ACCOUNTS_CONFIG")
+    # 3. 从文件加载
+    accounts_data = _load_from_file()
+    if accounts_data is not None:
+        if accounts_data:
+            logger.info(f"[CONFIG] 从文件加载配置: {ACCOUNTS_FILE}，共 {len(accounts_data)} 个账户")
+        else:
+            logger.warning(f"[CONFIG] 账户配置为空，请在管理面板添加账户或编辑 {ACCOUNTS_FILE}")
+        return accounts_data
+
+    # 4. 无配置，创建空配置
+    logger.warning(f"[CONFIG] 未找到配置，已创建空配置")
+    logger.info(f"[CONFIG] 💡 请在管理面板添加账户，或设置 DATABASE_URL 使用数据库存储")
     save_accounts_to_file([])
     return []
 
@@ -387,15 +446,23 @@ def load_multi_account_config(
             csesidx=acc["csesidx"],
             config_id=acc["config_id"],
             expires_at=acc.get("expires_at"),
-            disabled=acc.get("disabled", False)  # 读取手动禁用状态，默认为 False
+            disabled=acc.get("disabled", False),  # 读取手动禁用状态，默认为False
+            mail_provider=acc.get("mail_provider"),
+            mail_address=acc.get("mail_address"),
+            mail_password=acc.get("mail_password") or acc.get("email_password"),
+            mail_client_id=acc.get("mail_client_id"),
+            mail_refresh_token=acc.get("mail_refresh_token"),
+            mail_tenant=acc.get("mail_tenant"),
         )
 
-        # 检查账户是否已过期
-        if config.is_expired():
-            logger.warning(f"[CONFIG] 账户 {config.account_id} 已过期，跳过加载")
-            continue
+        # 检查账户是否已过期（已过期也加载到管理面板）
+        is_expired = config.is_expired()
+        if is_expired:
+            logger.warning(f"[CONFIG] 账户 {config.account_id} 已过期，仍加载用于展示")
 
         manager.add_account(config, http_client, user_agent, account_failure_threshold, rate_limit_cooldown_seconds, global_stats)
+        if is_expired:
+            manager.accounts[config.account_id].is_available = False
 
     if not manager.accounts:
         logger.warning(f"[CONFIG] 没有有效的账户配置，服务将启动但无法处理请求，请在管理面板添加账户")
